@@ -231,14 +231,16 @@ jobs:
   #   engine    p6_step_on_any_small_frame_is_total         (timeout 1800 s at 16 GiB)
   #   dhcpv4    p6_dhcpv4_parse_is_total                    (OOM at 3.5 GiB)
   #   tcp       p6_tcp_options_walk_is_total                (timeout 600 s; OOM at 6 GiB)
-  # On 2026-11-12 the first of them took the runner down after 7 minutes
-  # with no verdict for any harness. A green `kani (cambios-netcore)` covers
+  # On 2026-11-12 the job was cancelled 7 minutes into the first of them
+  # ("The runner has received a shutdown signal", cause unknown), with no
+  # verdict for any harness. A green `kani (cambios-netcore)` covers
   # the listed harnesses only; spec/claims/net.md records the large-host
   # verdicts. `--harness` matches by substring, so each name below must not
   # occur inside one of the five.
   # The engine harness, even with `TxRing::push` replaced by its proven
-  # stand-in, took the runner down after 24 minutes on 2026-11-12 (run on
-  # 59670a7, no verdict), so it stays off CI.
+  # stand-in, was cancelled after 24 minutes on 2026-11-12 (run 43292730141
+  # on 59670a7: "The runner has received a shutdown signal", cause unknown,
+  # no verdict), so it stays off CI.
   # Revisit when: each of the five has a recorded large-host verdict and
   # either fits a hosted runner (move it into the list) or a self-hosted
   # large runner exists for a second netcore entry.
