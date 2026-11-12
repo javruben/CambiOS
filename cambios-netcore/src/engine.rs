@@ -2087,7 +2087,9 @@ mod proofs {
     /// Stand-in for `TxRing::push` in the engine harnesses.
     ///
     /// Contract (proved for `TxRing::push` by
-    /// `p6_tx_ring_push_meets_its_contract` below, for every ring state):
+    /// `p6_tx_ring_push_meets_its_contract` below, for any `start`, `len`
+    /// and `sent`, and `mem` up to `RING` = 16 octets. That covers every
+    /// call in the engine harness, whose whole store is 16 octets):
     /// - the return value is `n = min(data.len(), mem.len() - len)`
     ///   (saturating), exactly as `push` computes it;
     /// - `len` grows by `n` (saturating); `start` and `sent` are unchanged;
@@ -2124,17 +2126,21 @@ mod proofs {
     const HAVOC: usize = 64;
 
     /// SCAFFOLDING: widest ring and data slice in the `push` harnesses.
-    /// Why: one more than a wrap of a full ring; `push`'s loop is per
-    /// octet, so the solver cost grows with this bound.
-    /// Replace when: a larger bound is affordable, or `push` changes.
-    const RING: usize = 8;
+    /// Why: the engine harness's store is 16 octets, so no socket's `mem`
+    /// is wider. Data wider than `mem` adds nothing: `push` reads at most
+    /// `n <= mem.len()` octets of it, and for `mem.len() <= 16` it computes
+    /// the same `n` for any `data.len() >= 16`. `push`'s loop is per octet,
+    /// so the solver cost grows with this bound.
+    /// Replace when: an engine harness uses a wider store, or `push` changes.
+    const RING: usize = 16;
 
-    /// `TxRing::push` meets the stand-in's contract for every ring state
-    /// (any `start`, `len`, `sent`, no assumption) and any `mem` and
-    /// `data` up to `RING` octets: the exact return value, the ring
-    /// fields, writes only inside `mem`, no panic or overflow.
+    /// `TxRing::push` meets the stand-in's contract for any `start`, `len`
+    /// and `sent` (no assumption on the ring) and any `mem` and `data` up
+    /// to `RING` = 16 octets: the exact return value, the ring fields,
+    /// writes only inside `mem`, no panic or overflow. Bounded: wider
+    /// `mem` is not covered.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(18)]
     fn p6_tx_ring_push_meets_its_contract() {
         let mut mem: [u8; RING] = kani::any();
         let data: [u8; RING] = kani::any();
@@ -2149,14 +2155,15 @@ mod proofs {
         assert_eq!(ring.sent, before.sent);
     }
 
-    /// Octet semantics of `TxRing::push`, for ring states the engine
-    /// creates (`start < cap`, `len <= cap`: `EMPTY`, then only `push`
-    /// and `release`, which keep both): `data[k]` lands at
-    /// `(start + len + k) mod cap` for each `k < n`, and every other
-    /// octet of `mem` is unchanged. Only this property assumes that
-    /// invariant; the stand-in above does not rely on it.
+    /// Octet semantics of `TxRing::push` for `mem` of 1..=16 octets and
+    /// data up to 16, for ring states the engine creates (`start < cap`,
+    /// `len <= cap`: `EMPTY`, then only `push` and `release`, which keep
+    /// both): `data[k]` lands at `(start + len + k) mod cap` for each
+    /// `k < n`, and every other octet of `mem` is unchanged. Only this
+    /// property assumes that invariant; the stand-in above does not rely
+    /// on it.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(18)]
     fn p6_tx_ring_push_copies_data_in_ring_order() {
         let mut mem: [u8; RING] = kani::any();
         let data: [u8; RING] = kani::any();
