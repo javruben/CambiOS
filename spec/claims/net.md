@@ -185,6 +185,8 @@ Evidence (build1-4060, logs `/root/netcore-s/logs/s4-*`, summary `~/.naoms/agent
 - Control, the pre-D1 ISO, 6 boots: 5 PASS, and the one failure was the same echo stall. So the echo stall predates D1.
 - riscv64 TCG with udp-stack restored: 2/2.
 Kani on the re-bounded harnesses (engine P6 at 0..=42, DHCPv4 P6 at 0..=260): both "Out of memory" at a 3.5 GiB cap, so NO VERDICT. A rerun on a larger host is booked.
+
+CI (`.github/workflows/proofs.yml`, `kani (cambios-netcore)`): on 2026-11-12 the job ran every harness in one `cargo kani` invocation. The hosted runner shut down 7 minutes into `p6_checksum_add_bytes_is_total_up_to_frame` (inference: out of memory), with NO verdict for any harness. The CI entry now names the 27 harnesses that were SUCCESSFUL locally on 2026-11-10. The five no-verdict harnesses (both checksum stages, TCP option walk, DHCPv4 P6, engine P6) run only on a large-host seat. A green CI check covers those 27 and nothing more. The changed CI entry has not run yet.
 Not shown: renewal and expiry on the wire (slirp leases outlast a boot), a lease that changes the address on a real network, and multiple DHCP servers.
 
 ## Verification-route decision (draft)

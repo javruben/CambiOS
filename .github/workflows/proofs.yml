@@ -224,6 +224,22 @@ jobs:
   # success as a no-op. fail-fast off so one regression still reports the
   # others.
   #
+  # cambios-netcore runs a named harness list, not every harness. Five
+  # harnesses do not finish on a hosted runner and run only on a large host:
+  #   checksum  p6_checksum_add_bytes_is_total_up_to_frame  (OOM at 3.5 GiB)
+  #   checksum  p6_checksum_is_total_up_to_frame            (timeout 1800 s)
+  #   engine    p6_step_on_any_small_frame_is_total         (timeout 1800 s at 16 GiB)
+  #   dhcpv4    p6_dhcpv4_parse_is_total                    (OOM at 3.5 GiB)
+  #   tcp       p6_tcp_options_walk_is_total                (timeout 600 s; OOM at 6 GiB)
+  # On 2026-11-12 the first of them took the runner down after 7 minutes
+  # with no verdict for any harness. A green `kani (cambios-netcore)` covers
+  # the listed harnesses only; spec/claims/net.md records the large-host
+  # verdicts. `--harness` matches by substring, so each name below must not
+  # occur inside one of the five.
+  # Revisit when: each of the five has a recorded large-host verdict and
+  # either fits a hosted runner (move it into the list) or a self-hosted
+  # large runner exists for a second netcore entry.
+  #
   # Matrix fields: `crate` is the check name, `kani (<crate>)`, unchanged for
   # the six kernel crates; `dir` is where `cargo kani` runs; `args` are extra
   # Kani flags; `build_target`, when set, overrides a crate-local
@@ -245,7 +261,7 @@ jobs:
           - { crate: capability-proofs, group: proofs, dir: verification/capability-proofs, args: '', build_target: '' }
           - { crate: userslice-proofs, group: proofs, dir: verification/userslice-proofs, args: '', build_target: '' }
           - { crate: dtb-proofs, group: proofs, dir: verification/dtb-proofs, args: '', build_target: '' }
-          - { crate: cambios-netcore, group: netcore, dir: cambios-netcore, args: '-Z stubbing', build_target: x86_64-unknown-linux-gnu }
+          - { crate: cambios-netcore, group: netcore, dir: cambios-netcore, args: '-Z stubbing --harness siphash24_is_total --harness p1_acceptable_is_translation_invariant --harness p1_acceptable_matches_rfc9293_table --harness p8_sendable_stays_inside_both_windows --harness edges_equal_transitions_membership --harness p2_close_takes_one_table_edge --harness p2_reach2_is_the_two_edge_closure --harness p2_segment_from_ --harness p3_exact_rst_closes --harness p3_non_exact_rst_changes_nothing --harness p4_syn_in_synchronized_state_is_challenged --harness p6_arp_parse_is_total --harness p6_classify_is_total_up_to_1514 --harness p6_ipv4_parse_is_total --harness p6_icmpv4_parse_is_total --harness p6_tcp_parse_is_total --harness p6_udp_parse_is_total', build_target: x86_64-unknown-linux-gnu }
     steps:
       - name: No proof-relevant changes — skip (report success)
         if: needs.changes.outputs[matrix.group] != 'true'
