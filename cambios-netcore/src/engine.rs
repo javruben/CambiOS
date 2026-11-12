@@ -2106,24 +2106,17 @@ mod proofs {
         let cap = mem.len();
         let n = data.len().min(cap.saturating_sub(ring.len));
         ring.len = ring.len.saturating_add(n);
-        if cap <= HAVOC {
-            let any: [u8; HAVOC] = kani::any();
-            if let (Some(dst), Some(src)) = (mem.get_mut(..cap), any.get(..cap)) {
-                dst.copy_from_slice(src);
-            }
-        } else {
-            for b in mem.iter_mut() {
-                *b = kani::any();
-            }
+        // The contract is proved for `mem` up to `RING` octets only, so the
+        // stand-in refuses anything wider. This is an assertion, not an
+        // assumption: a wider call fails the harness instead of being
+        // silently excluded.
+        assert!(cap <= RING);
+        let any: [u8; RING] = kani::any();
+        if let (Some(dst), Some(src)) = (mem.get_mut(..cap), any.get(..cap)) {
+            dst.copy_from_slice(src);
         }
         n
     }
-
-    /// SCAFFOLDING: widest `mem` the stand-in overwrites with one copy;
-    /// wider slices take the per-octet path.
-    /// Why: covers the 16-octet store of the engine harness.
-    /// Replace when: an engine harness uses a store wider than 64 octets.
-    const HAVOC: usize = 64;
 
     /// SCAFFOLDING: widest ring and data slice in the `push` harnesses.
     /// Why: the engine harness's store is 16 octets, so no socket's `mem`

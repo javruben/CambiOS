@@ -236,10 +236,9 @@ jobs:
   # the listed harnesses only; spec/claims/net.md records the large-host
   # verdicts. `--harness` matches by substring, so each name below must not
   # occur inside one of the five.
-  # `cambios-netcore-engine` runs the engine harness alone, now that
-  # `TxRing::push` is replaced inside it by a stand-in whose contract the
-  # two `p6_tx_ring_push_*` harnesses prove. Running alone means that if it
-  # exhausts the runner, it costs only its own job.
+  # The engine harness, even with `TxRing::push` replaced by its proven
+  # stand-in, took the runner down after 24 minutes on 2026-11-12 (run on
+  # 59670a7, no verdict), so it stays off CI.
   # Revisit when: each of the five has a recorded large-host verdict and
   # either fits a hosted runner (move it into the list) or a self-hosted
   # large runner exists for a second netcore entry.
@@ -266,7 +265,6 @@ jobs:
           - { crate: userslice-proofs, group: proofs, dir: verification/userslice-proofs, args: '', build_target: '' }
           - { crate: dtb-proofs, group: proofs, dir: verification/dtb-proofs, args: '', build_target: '' }
           - { crate: cambios-netcore, group: netcore, dir: cambios-netcore, args: '-Z stubbing --harness siphash24_is_total --harness p1_acceptable_is_translation_invariant --harness p1_acceptable_matches_rfc9293_table --harness p8_sendable_stays_inside_both_windows --harness edges_equal_transitions_membership --harness p2_close_takes_one_table_edge --harness p2_reach2_is_the_two_edge_closure --harness p2_segment_from_ --harness p3_exact_rst_closes --harness p3_non_exact_rst_changes_nothing --harness p4_syn_in_synchronized_state_is_challenged --harness p6_arp_parse_is_total --harness p6_classify_is_total_up_to_1514 --harness p6_ipv4_parse_is_total --harness p6_icmpv4_parse_is_total --harness p6_tcp_parse_is_total --harness p6_udp_parse_is_total --harness p6_tx_ring_push_', build_target: x86_64-unknown-linux-gnu }
-          - { crate: cambios-netcore-engine, group: netcore, dir: cambios-netcore, args: '-Z stubbing --exact --harness engine::proofs::p6_step_on_any_small_frame_is_total', build_target: x86_64-unknown-linux-gnu }
     steps:
       - name: No proof-relevant changes — skip (report success)
         if: needs.changes.outputs[matrix.group] != 'true'
