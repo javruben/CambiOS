@@ -42,8 +42,13 @@ mod phy;
 mod regs;
 #[allow(unsafe_code)]
 mod ring;
+// The driver half of the ADR-039 § 2 seam is device-independent; both
+// NIC drivers compile the one source file.
+#[path = "../../virtio-net/src/seam.rs"]
+mod seam;
 
 use cambios_libsys as sys;
+use cambios_net_proto as proto;
 use mmio::{spin_delay, Mmio};
 use regs::*;
 use ring::{DmaBuf, Ring, BUF_SIZE, RING_SIZE};
@@ -58,6 +63,10 @@ use ring::{DmaBuf, Ring, BUF_SIZE, RING_SIZE};
 // ============================================================================
 
 const NET_ENDPOINT: u32 = 20;
+
+/// TUNING: frames taken from the stack's TX ring per loop pass (the same
+/// budget as virtio-net); `send_packet` waits for each descriptor.
+const SEAM_TX_BUDGET: usize = 32;
 
 const CMD_SEND_PACKET: u8 = 1;
 const CMD_RECV_PACKET: u8 = 2;
@@ -337,6 +346,15 @@ fn print_mac(mac: &[u8; 6]) {
 // Request handlers
 // ============================================================================
 
+impl seam::Nic for I219Driver {
+    fn transmit(&mut self, frame: &[u8]) {
+        let _ = self.send_packet(frame);
+    }
+    fn receive(&mut self, buf: &mut [u8]) -> usize {
+        self.recv_packet(buf)
+    }
+}
+
 fn handle_get_mac(driver: &I219Driver, response: &mut [u8]) -> usize {
     response[0] = STATUS_OK;
     response[1..7].copy_from_slice(&driver.mac);
@@ -422,35 +440,51 @@ fn run() -> ! {
         sys::print(b"[I219] ready on endpoint 20 (link down)\n");
     }
 
+    // Without a seam the loop blocks on ep 20 (the legacy SEND_PACKET /
+    // RECV_PACKET path). With one open it polls ep 20, pumps both rings,
+    // then yields.
+    // Deferred: SEND_PACKET / RECV_PACKET removal (ADR-039 § 2).
+    // Why: the same staging as virtio-net; udp-stack is the only client.
+    // Revisit when: user/net-stack replaces udp-stack in manifest.toml.
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];
+    let mut seam: Option<seam::Seam> = None;
 
     loop {
-        let msg = match sys::recv_verified(NET_ENDPOINT, &mut recv_buf) {
-            Some(msg) => msg,
-            None => {
-                sys::yield_now();
-                continue;
+        let polled = seam.is_some();
+        let msg = if polled {
+            sys::try_recv_verified(NET_ENDPOINT, &mut recv_buf)
+        } else {
+            sys::recv_verified(NET_ENDPOINT, &mut recv_buf)
+        };
+        let got_msg = msg.is_some();
+
+        if let Some(msg) = msg {
+            if let Some((cmd, cmd_data)) = msg.command() {
+                let resp_len = match cmd {
+                    CMD_SEND_PACKET => Some(handle_send_packet(&mut driver, cmd_data, &mut resp_buf)),
+                    CMD_RECV_PACKET => Some(handle_recv_packet(&mut driver, &mut resp_buf)),
+                    CMD_GET_MAC => Some(handle_get_mac(&driver, &mut resp_buf)),
+                    CMD_GET_STATUS => Some(handle_get_status(&driver, &mut resp_buf)),
+                    proto::NIC_OPEN_SEAM | proto::NIC_CLOSE_SEAM | proto::NIC_DOORBELL_TX => {
+                        seam::handle_command(&mut seam, msg.sender(), msg.payload(), &mut resp_buf)
+                    }
+                    _ => {
+                        resp_buf[0] = STATUS_ERROR;
+                        Some(1)
+                    }
+                };
+                if let Some(n) = resp_len {
+                    sys::write(msg.from_endpoint(), &resp_buf[..n]);
+                }
             }
-        };
+        }
 
-        let (cmd, cmd_data) = match msg.command() {
-            Some(pair) => pair,
-            None => continue,
-        };
+        seam::service(&mut seam, &mut driver, SEAM_TX_BUDGET, RING_SIZE);
 
-        let resp_len = match cmd {
-            CMD_SEND_PACKET => handle_send_packet(&mut driver, cmd_data, &mut resp_buf),
-            CMD_RECV_PACKET => handle_recv_packet(&mut driver, &mut resp_buf),
-            CMD_GET_MAC => handle_get_mac(&driver, &mut resp_buf),
-            CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
-            _ => {
-                resp_buf[0] = STATUS_ERROR;
-                1
-            }
-        };
-
-        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
+        if !got_msg {
+            sys::yield_now();
+        }
     }
 }
 

@@ -353,6 +353,7 @@ impl SyscallDispatcher {
             SyscallNumber::InstallMasterKey => {
                 Self::handle_install_master_key(args, &ctx)
             }
+            SyscallNumber::GetEntropy => Self::handle_get_entropy(args, &ctx),
         }
     }
 
@@ -1081,6 +1082,58 @@ impl SyscallDispatcher {
         out_slice.write_from(principal.aid())?;
 
         Ok(32)
+    }
+
+    /// SYS_GET_ENTROPY (76): fill a user buffer from the CPU's hardware
+    /// random number generator (owner ruling 2026-11-10, the one
+    /// exception to ADR-039's no-new-syscall rule).
+    ///
+    /// Args: arg1 = buf (user vaddr), arg2 = len (1..=MAX_ENTROPY_REQUEST)
+    ///
+    /// Returns `len`. Fails closed: `Enosys` when the CPU has no hardware
+    /// generator, `WouldBlock` when it reports exhaustion past its retry
+    /// bound. Nothing is stretched or substituted in software, so a
+    /// caller never receives bytes the hardware did not produce. The
+    /// kernel-stack copy is wiped before returning (the
+    /// `zeroize_master` pattern).
+    ///
+    /// Lock ordering: takes no lock; the user copy walks page tables.
+    fn handle_get_entropy(args: SyscallArgs, ctx: &SyscallContext) -> SyscallResult {
+        use cambios_abi::MAX_ENTROPY_REQUEST;
+        let out_buf = args.arg1;
+        let len = args.arg_usize(2);
+        if len == 0 || len > MAX_ENTROPY_REQUEST {
+            return Err(SyscallError::InvalidArg);
+        }
+        let out_slice = UserWriteSlice::validate(ctx, out_buf, len)?;
+
+        let mut buf = [0u8; MAX_ENTROPY_REQUEST];
+        let mut filled = Ok(());
+        for chunk in buf[..len].chunks_mut(8) {
+            match crate::arch::hw_random_u64() {
+                Ok(v) => chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]),
+                Err(e) => {
+                    filled = Err(match e {
+                        crate::arch::EntropyError::Unsupported => SyscallError::Enosys,
+                        crate::arch::EntropyError::Exhausted => SyscallError::WouldBlock,
+                    });
+                    break;
+                }
+            }
+        }
+        let written = filled.and_then(|()| out_slice.write_from(&buf[..len]));
+        for b in buf.iter_mut() {
+            // SAFETY: `b` is a unique mutable reference to a u8 that we
+            // own (kernel stack), and we write a fixed valid value (0).
+            // The volatile store keeps the optimizer from eliding what
+            // looks like a dead store to a buffer about to go out of
+            // scope (same as `zeroize_master`).
+            unsafe {
+                core::ptr::write_volatile(b as *mut u8, 0);
+            }
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        written.map(|()| len as u64)
     }
 
     // ========================================================================
@@ -2891,7 +2944,14 @@ impl SyscallDispatcher {
 
     /// SYS_CHANNEL_CLOSE: Close a channel gracefully.
     ///
-    /// Args: arg1 = channel_id (u64)
+    /// Args: arg1 = channel_id (u64), arg2 = reason
+    /// (`CHANNEL_CLOSE_REASON_*`; anything else is `InvalidArg` and
+    /// closes nothing).
+    ///
+    /// With `CHANNEL_CLOSE_REASON_PEER_VIOLATION` the closer accuses the
+    /// other side of breaking the ring protocol (ADR-039 § 4): the kernel
+    /// emits `chan.peer_violation` naming that side, then `chan.closed`.
+    /// The close itself is identical either way.
     ///
     /// Lock ordering: CHANNEL_MANAGER(5) → PROCESS_TABLE(6) → FRAME_ALLOCATOR(7),
     /// then TLB shootdown (lock-free).
@@ -2899,6 +2959,11 @@ impl SyscallDispatcher {
         use crate::ipc::channel::ChannelId;
 
         let channel_id = ChannelId::from_raw(args.arg1);
+        let peer_violation = match args.arg2 {
+            cambios_abi::CHANNEL_CLOSE_REASON_NORMAL => false,
+            cambios_abi::CHANNEL_CLOSE_REASON_PEER_VIOLATION => true,
+            _ => return Err(SyscallError::InvalidArg),
+        };
 
         // --- Close in ChannelManager (returns the record) ---
         let record = {
@@ -2916,15 +2981,28 @@ impl SyscallDispatcher {
         // --- Unmap from both processes + free VMA slots ---
         Self::teardown_channel_mappings(&record);
 
+        if peer_violation {
+            // `close` succeeded, so the caller is the creator or the peer;
+            // the accused is the other side.
+            let accused = if record.creator_pid == ctx.process_id {
+                record.peer_pid
+            } else {
+                Some(record.creator_pid)
+            };
+            crate::audit::emit(crate::audit::RawAuditEvent::channel_peer_violation(
+                ctx.process_id, channel_id.as_raw(), accused, crate::audit::now(), 0,
+            ));
+        }
         crate::audit::emit(crate::audit::RawAuditEvent::channel_closed(
             ctx.process_id, channel_id.as_raw(), 0, 0, crate::audit::now(), 0,
         ));
 
         crate::println!(
-            "  [ChannelClose] pid={} channel={} pages={}",
+            "  [ChannelClose] pid={} channel={} pages={} peer_violation={}",
             ctx.process_id.slot(),
             channel_id.as_raw(),
             record.num_pages,
+            peer_violation,
         );
 
         Ok(0)
@@ -3229,12 +3307,14 @@ impl SyscallDispatcher {
     ///   tombstone zero page. Subsequent reads return zeros instead
     ///   of faulting. Closes the HN-blocker compositor #PF on clean
     ///   client exit (first observed 2026-04-25).
-    /// - **RW mapping** → unmap (existing behavior). Tombstone-as-RW
-    ///   would need per-peer scratch pages; deferred per ADR-007
-    ///   Divergence entry 8. Subsequent writes fault and the writer is
-    ///   killed by the existing #PF handler — acceptable for the
-    ///   catastrophic-state cases this covers (e.g., compositor →
-    ///   scanout-driver where the consumer dies).
+    /// - **RW mapping** → unmap-then-remap every page to that side's own
+    ///   scratch frame (ADR-007 Divergence entry 8, ADR-039 § 9), mapped
+    ///   user-writable. A write racing the revoke sinks into a frame only
+    ///   that process maps, instead of faulting it; no other process can
+    ///   read it, so nothing leaks. Cooperating userspace still observes
+    ///   `Revoked` via `SYS_CHANNEL_INFO` and drops the dead ring. A side
+    ///   with no scratch frame (already destroyed, so `scratch_phys` is 0)
+    ///   is unmapped as before.
     ///
     /// Writability per side comes from `record.role`:
     /// - `Producer`: creator RW, peer RO
@@ -3279,13 +3359,31 @@ impl SyscallDispatcher {
                             let mut page_table =
                                 crate::memory::paging::page_table_from_cr3(creator_cr3);
                             let remap_creator = !creator_writable && tombstone != 0;
+                            let scratch = if creator_writable { pt.scratch_phys(record.creator_pid) } else { 0 };
                             for i in 0..record.num_pages as u64 {
                                 let vaddr = record.creator_vaddr + i * 4096;
                                 // Unmap original. Discard PhysFrame — the
                                 // original frames are freed in bulk below
                                 // via `free_contiguous`.
                                 let _ = crate::memory::paging::unmap_page(&mut page_table, vaddr);
-                                if remap_creator {
+                                if scratch != 0 {
+                                    // SAFETY: `scratch` is the creator's own
+                                    // scratch frame, allocated and zeroed in
+                                    // `ProcessDescriptor::new`, freed only when
+                                    // the creator is destroyed; it is mapped
+                                    // into no other address space, so a
+                                    // user-writable mapping leaks nothing
+                                    // across processes. The PTE was just
+                                    // unmapped above, so map_page does not
+                                    // collide.
+                                    let _ = crate::memory::paging::map_page(
+                                        &mut page_table,
+                                        vaddr,
+                                        scratch,
+                                        crate::memory::paging::flags::user_rw(),
+                                        &mut fa_guard,
+                                    );
+                                } else if remap_creator {
                                     // SAFETY: `tombstone` was allocated and
                                     // zeroed once at boot by `init_tombstone`;
                                     // `user_ro()` flags expose it as readable
@@ -3319,13 +3417,25 @@ impl SyscallDispatcher {
                                 let mut page_table =
                                     crate::memory::paging::page_table_from_cr3(peer_cr3);
                                 let remap_peer = !peer_writable && tombstone != 0;
+                                let scratch = if peer_writable { pt.scratch_phys(peer_pid) } else { 0 };
                                 for i in 0..record.num_pages as u64 {
                                     let vaddr = record.peer_vaddr + i * 4096;
                                     let _ = crate::memory::paging::unmap_page(
                                         &mut page_table,
                                         vaddr,
                                     );
-                                    if remap_peer {
+                                    if scratch != 0 {
+                                        // SAFETY: as the creator-side scratch
+                                        // remap above: the peer's own frame,
+                                        // in no other address space.
+                                        let _ = crate::memory::paging::map_page(
+                                            &mut page_table,
+                                            vaddr,
+                                            scratch,
+                                            crate::memory::paging::flags::user_rw(),
+                                            &mut fa_guard,
+                                        );
+                                    } else if remap_peer {
                                         // SAFETY: same as creator-side
                                         // remap above.
                                         let _ = crate::memory::paging::map_page(
@@ -3367,9 +3477,10 @@ impl SyscallDispatcher {
 
         // Free the original contiguous physical frames. The PTEs that
         // formerly pointed at them have been swapped to the tombstone
-        // (RO sides) or unmapped (RW sides), so no live mapping
-        // references this region anymore. The tombstone itself is
-        // never freed.
+        // (RO sides), to the side's scratch frame (RW sides), or
+        // unmapped, so no live mapping references this region anymore.
+        // The tombstone is never freed; a scratch frame is freed with its
+        // process.
         {
             let mut fa_guard = crate::FRAME_ALLOCATOR.lock();
             let _ = fa_guard.free_contiguous(record.physical_base, record.num_pages as usize);

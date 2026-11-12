@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-net-seam"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "The packet ring of the CambiOS NIC-driver <-> network-stack seam only: a bounded single-producer/single-consumer frame ring over that seam's two ADR-005 channel pages, with every peer-written value treated as hostile. A per-consumer ring convention (ADR-005 Divergence item 6), not a shared channel library. Pure logic over a page abstraction, plus one isolated module implementing that abstraction over a live mapping; no allocation."
+
+[lib]
+name = "net_seam"
+path = "src/lib.rs"
+
+# Standalone crate, excluded from the kernel workspace (root Cargo.toml
+# `exclude`). The empty table stops cargo's upward workspace search here,
+# so it also builds from a worktree nested inside another checkout.
+[workspace]
+
+# No runtime dependencies: the ring sits on the egress trust boundary
+# (ADR-039 § 11).
+[dependencies]
+
+[lints.rust]
+# The pure ring has no unsafe; `src/mapped.rs` (the page implementation
+# over a live channel mapping) is the one module allowed it.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

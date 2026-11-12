@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent project's bare-metal kernel target so this crate can
+# be built and tested standalone (`cd user/net-seam && cargo test`). Same
+# precedent as cambios-netcore/.cargo/config.toml. CI and build hosts pass
+# `--target` explicitly.
+[build]
+target = "aarch64-apple-darwin"

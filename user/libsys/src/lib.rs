@@ -1189,6 +1189,16 @@ pub fn set_wallclock(unix_secs: u64, source_tag: u8) -> i64 {
     syscall_raw3(SyscallNumber::SetWallclock as u64, unix_secs, source_tag as u64, 0)
 }
 
+/// Fill `buf` from the CPU's hardware random number generator
+/// (`SYS_GET_ENTROPY`, owner ruling 2026-11-10). `buf.len()` must be
+/// 1..=`cambios_abi::MAX_ENTROPY_REQUEST`. Returns the length on success,
+/// `Enosys` (negative) when the CPU has no generator, `WouldBlock` when
+/// it reported exhaustion. Never software randomness: treat any error
+/// as "no secret available" and fail closed.
+pub fn get_entropy(buf: &mut [u8]) -> i64 {
+    syscall_raw3(SyscallNumber::GetEntropy as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)
+}
+
 /// Read the current wall-clock as Unix seconds. Returns `0` before any
 /// successful `SetWallclock` (sentinel — the Unix epoch is unrepresentable
 /// in practice, so the value cannot legitimately be zero). Lock-free,
@@ -1240,7 +1250,24 @@ pub fn channel_attach(channel_id: u64) -> i64 {
 ///
 /// Only the creator or peer may call this. Returns 0 on success.
 pub fn channel_close(channel_id: u64) -> i64 {
-    syscall_raw3(SyscallNumber::ChannelClose as u64, channel_id, 0, 0)
+    syscall_raw3(
+        SyscallNumber::ChannelClose as u64,
+        channel_id,
+        cambios_abi::CHANNEL_CLOSE_REASON_NORMAL,
+        0,
+    )
+}
+
+/// Close a channel because the other side broke the ring protocol
+/// (ADR-039 § 4). The close is the same as [`channel_close`]; the kernel
+/// also records `chan.peer_violation` naming the other side.
+pub fn channel_close_peer_violation(channel_id: u64) -> i64 {
+    syscall_raw3(
+        SyscallNumber::ChannelClose as u64,
+        channel_id,
+        cambios_abi::CHANNEL_CLOSE_REASON_PEER_VIOLATION,
+        0,
+    )
 }
 
 /// `TeardownKind` discriminants for the two-phase teardown syscall
