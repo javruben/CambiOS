@@ -2084,10 +2084,106 @@ mod proofs {
         }
     }
 
+    /// Stand-in for `TxRing::push` in the engine harnesses.
+    ///
+    /// Contract (proved for `TxRing::push` by
+    /// `p6_tx_ring_push_meets_its_contract` below, for every ring state):
+    /// - the return value is `n = min(data.len(), mem.len() - len)`
+    ///   (saturating), exactly as `push` computes it;
+    /// - `len` grows by `n` (saturating); `start` and `sent` are unchanged;
+    /// - `push` writes only inside `mem` and never panics.
+    ///
+    /// The stand-in keeps the first two points exactly and replaces the
+    /// octets of `mem` with arbitrary values. `push` writes some of them
+    /// and leaves the rest, so the stand-in allows every outcome `push` can
+    /// produce, and more. It assumes nothing about its inputs. What the
+    /// engine harness proves with it holds for the real `push`. The octet
+    /// values themselves are the subject of
+    /// `p6_tx_ring_push_copies_data_in_ring_order`.
+    fn tx_ring_push_stub(ring: &mut TxRing, mem: &mut [u8], data: &[u8]) -> usize {
+        let cap = mem.len();
+        let n = data.len().min(cap.saturating_sub(ring.len));
+        ring.len = ring.len.saturating_add(n);
+        if cap <= HAVOC {
+            let any: [u8; HAVOC] = kani::any();
+            if let (Some(dst), Some(src)) = (mem.get_mut(..cap), any.get(..cap)) {
+                dst.copy_from_slice(src);
+            }
+        } else {
+            for b in mem.iter_mut() {
+                *b = kani::any();
+            }
+        }
+        n
+    }
+
+    /// SCAFFOLDING: widest `mem` the stand-in overwrites with one copy;
+    /// wider slices take the per-octet path.
+    /// Why: covers the 16-octet store of the engine harness.
+    /// Replace when: an engine harness uses a store wider than 64 octets.
+    const HAVOC: usize = 64;
+
+    /// SCAFFOLDING: widest ring and data slice in the `push` harnesses.
+    /// Why: one more than a wrap of a full ring; `push`'s loop is per
+    /// octet, so the solver cost grows with this bound.
+    /// Replace when: a larger bound is affordable, or `push` changes.
+    const RING: usize = 8;
+
+    /// `TxRing::push` meets the stand-in's contract for every ring state
+    /// (any `start`, `len`, `sent`, no assumption) and any `mem` and
+    /// `data` up to `RING` octets: the exact return value, the ring
+    /// fields, writes only inside `mem`, no panic or overflow.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn p6_tx_ring_push_meets_its_contract() {
+        let mut mem: [u8; RING] = kani::any();
+        let data: [u8; RING] = kani::any();
+        let (m, d): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(m <= RING && d <= RING);
+        let mut ring = TxRing { start: kani::any(), len: kani::any(), sent: kani::any() };
+        let before = ring;
+        let n = ring.push(&mut mem[..m], &data[..d]);
+        assert_eq!(n, d.min(m.saturating_sub(before.len)));
+        assert_eq!(ring.len, before.len.saturating_add(n));
+        assert_eq!(ring.start, before.start);
+        assert_eq!(ring.sent, before.sent);
+    }
+
+    /// Octet semantics of `TxRing::push`, for ring states the engine
+    /// creates (`start < cap`, `len <= cap`: `EMPTY`, then only `push`
+    /// and `release`, which keep both): `data[k]` lands at
+    /// `(start + len + k) mod cap` for each `k < n`, and every other
+    /// octet of `mem` is unchanged. Only this property assumes that
+    /// invariant; the stand-in above does not rely on it.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn p6_tx_ring_push_copies_data_in_ring_order() {
+        let mut mem: [u8; RING] = kani::any();
+        let data: [u8; RING] = kani::any();
+        let (m, d): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(m >= 1 && m <= RING && d <= RING);
+        let start: usize = kani::any();
+        let len: usize = kani::any();
+        kani::assume(start < m && len <= m);
+        let mut ring = TxRing { start, len, sent: 0 };
+        let old = mem;
+        let n = ring.push(&mut mem[..m], &data[..d]);
+        let p: usize = kani::any();
+        kani::assume(p < m);
+        // The k that writes position p, if any: p = (start + len + k) mod m.
+        let k = (p + m + m - (start + len) % m) % m;
+        if k < n {
+            assert_eq!(mem[p], data[k]);
+        } else {
+            assert_eq!(mem[p], old[p]);
+        }
+    }
+
     #[kani::proof]
     #[kani::stub(crate::wire::tcp::parse_options, crate::wire::tcp::proofs::parse_options_stub)]
     #[kani::stub(crate::checksum::Checksum::add_bytes, crate::checksum::proofs::add_bytes_stub)]
     #[kani::stub(crate::checksum::Checksum::verifies, crate::checksum::proofs::verifies_stub)]
+    #[kani::stub(TxRing::push, tx_ring_push_stub)]
     #[kani::unwind(70)]
     fn p6_step_on_any_small_frame_is_total() {
         let mut store = [0u8; 16];
