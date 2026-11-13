@@ -442,19 +442,14 @@ unsafe extern "C" fn kmain() -> ! {
         // Map ACPI physical memory into the HHDM before parsing.
         map_acpi_regions(rsdp_phys);
 
-        // SAFETY: All subsystems initialized. HHDM offset is set.
-        // ADR-021: typed BootError propagation from the interrupts
-        // subsystem (APIC init, IST stack alloc, APIC calibration).
-        // kmain returns `!` so no `?`; dispatch to boot_failed for
-        // the single typed halt path.
-        unsafe {
-            cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
-                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
-        }
-        println!("✓ APIC-driven scheduling active");
-
-        // PCI bus scan — discover devices for user-space drivers
-        // SAFETY: Single-threaded boot, interrupts just enabled but no PCI drivers yet.
+        // PCI bus scan — discover devices for user-space drivers. It runs
+        // before interrupts are enabled: once the APIC timer fires, the
+        // scheduler may switch this boot context out for init, and init's
+        // boot wave can keep it from resuming. build1-3626 saw that in 2 of
+        // 8 KVM boots: no "PCI:" line, every driver found no device, and
+        // the APs (started below) never came up.
+        // SAFETY: single-threaded BSP boot with interrupts still disabled;
+        // no PCI driver exists yet, so BAR sizing writes race nothing.
         unsafe { cambios_core::pci::scan() };
         let pci_count = cambios_core::pci::device_count();
         println!("✓ PCI: {} device(s) discovered", pci_count);
@@ -474,6 +469,17 @@ unsafe extern "C" fn kmain() -> ! {
             }
         }
         println!();
+
+        // SAFETY: All subsystems initialized. HHDM offset is set.
+        // ADR-021: typed BootError propagation from the interrupts
+        // subsystem (APIC init, IST stack alloc, APIC calibration).
+        // kmain returns `!` so no `?`; dispatch to boot_failed for
+        // the single typed halt path.
+        unsafe {
+            cambios_core::interrupts::init_hardware_interrupts(100, rsdp_phys)
+                .unwrap_or_else(|err| cambios_core::boot::boot_failed(err));
+        }
+        println!("✓ APIC-driven scheduling active");
     }
 
     #[cfg(target_arch = "aarch64")]

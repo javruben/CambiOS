@@ -217,10 +217,16 @@ pub enum SyscallNumber {
     /// region on success, or a negative error code.
     ChannelAttach = 29,
 
-    /// channel_close(channel_id: u64) -> i32
+    /// channel_close(channel_id: u64, reason: u64) -> i32
     /// Close a channel. Unmaps the shared region from both processes,
     /// issues TLB shootdown, and frees the physical pages. Only the
     /// creator or peer may call this. Returns 0 on success.
+    ///
+    /// `reason` is a `CHANNEL_CLOSE_REASON_*` value; any other value is
+    /// refused with `InvalidArg` before anything is closed.
+    /// `CHANNEL_CLOSE_REASON_PEER_VIOLATION` makes the kernel emit
+    /// `chan.peer_violation` naming the other side, then `chan.closed`
+    /// (ADR-039 § 4).
     ChannelClose = 30,
 
     // Slot 31 deliberately vacated: was `ChannelRevoke`, a third-party
@@ -829,7 +835,36 @@ pub enum SyscallNumber {
     /// rotates the *wrapped* envelope under the *same* master key
     /// without re-installing.
     InstallMasterKey = 75,
+
+    /// get_entropy(buf: *mut u8, len: usize) -> i64
+    /// Fill `buf[..len]` from the CPU's hardware random number generator
+    /// (x86_64 RDSEED, else RDRAND; aarch64 RNDR). `len` is
+    /// 1..=`MAX_ENTROPY_REQUEST`. Returns `len`; `Enosys` when the CPU has
+    /// no hardware generator, `WouldBlock` when it reports exhaustion.
+    /// The kernel never stretches or substitutes software randomness.
+    ///
+    /// The one hardware-RNG syscall the owner ruled as an exception to
+    /// ADR-039's no-new-syscall rule (2026-11-10): RFC 6528 initial
+    /// sequence numbers need a secret key, and nothing else in CambiOS
+    /// can supply one.
+    GetEntropy = 76,
 }
+
+/// Most octets one `get_entropy` call returns.
+/// TUNING: 256, the per-call limit of OpenBSD `getentropy(2)` and Linux
+/// `getrandom(2)`'s never-interrupted size; a key is 16 or 32 octets.
+/// Replace when: a caller needs more per call than a loop of 256s gives.
+pub const MAX_ENTROPY_REQUEST: usize = 256;
+
+/// `SYS_CHANNEL_CLOSE` `reason`: an ordinary close.
+pub const CHANNEL_CLOSE_REASON_NORMAL: u64 = 0;
+
+/// `SYS_CHANNEL_CLOSE` `reason`: the closer stopped trusting the other
+/// side because it broke the ring protocol (ADR-039 § 4,
+/// `PEER_VIOLATION_LIMIT`). The kernel records the accusation as
+/// `chan.peer_violation`; it cannot check it, so the event is the
+/// closer's claim, not a verdict.
+pub const CHANNEL_CLOSE_REASON_PEER_VIOLATION: u64 = 1;
 
 impl SyscallNumber {
     /// Canonical kebab-case names, one per variant, in declaration order.
@@ -908,6 +943,7 @@ impl SyscallNumber {
         ("verify-volume-header", Self::VerifyVolumeHeader),
         ("read-volume-header", Self::ReadVolumeHeader),
         ("install-master-key", Self::InstallMasterKey),
+        ("get-entropy", Self::GetEntropy),
     ];
 
     /// The canonical kebab-case name of this syscall.
@@ -973,7 +1009,8 @@ impl SyscallNumber {
             Self::AclGrant | Self::AclRevoke | Self::AclList |
             Self::VerifyVolumeHeader |
             Self::ReadVolumeHeader |
-            Self::InstallMasterKey
+            Self::InstallMasterKey |
+            Self::GetEntropy
         )
     }
 
@@ -1057,6 +1094,7 @@ impl SyscallNumber {
             73 => Some(Self::VerifyVolumeHeader),
             74 => Some(Self::ReadVolumeHeader),
             75 => Some(Self::InstallMasterKey),
+            76 => Some(Self::GetEntropy),
             _ => None,
         }
     }
@@ -1768,6 +1806,7 @@ mod tests {
             SyscallNumber::VerifyVolumeHeader,
             SyscallNumber::ReadVolumeHeader,
             SyscallNumber::InstallMasterKey,
+            SyscallNumber::GetEntropy,
         ];
 
         for &num in &all {
@@ -1804,8 +1843,9 @@ mod tests {
         // (50 Cambio, 51 Regalo, 52 Stream), ADR-029 POSIX file
         // syscalls (53..=72: FileOpen..AclList), and ADR-032 §
         // FDE-related syscalls (73 VerifyVolumeHeader, 74
-        // ReadVolumeHeader, 75 InstallMasterKey) round out the
-        // current high-water mark.
+        // ReadVolumeHeader, 75 InstallMasterKey) and 76 GetEntropy
+        // (owner ruling 2026-11-10) round out the current high-water
+        // mark.
         //
         // Slots 11, 18, 31 and 36 are deliberate gaps: 11 was
         // `BindPrincipal` and 31 `ChannelRevoke` (bootstrap-only gates,
@@ -1815,7 +1855,7 @@ mod tests {
         // boot-release chain. Reuse of any is prohibited (see the slot
         // comments up by the variant definitions). `from_u64` must
         // return None for each and they are excluded from the sweep.
-        for i in 0..=75u64 {
+        for i in 0..=76u64 {
             if matches!(i, 11 | 18 | 31 | 36) {
                 assert!(SyscallNumber::from_u64(i).is_none(),
                     "slot {} must remain vacated; reuse is prohibited", i);

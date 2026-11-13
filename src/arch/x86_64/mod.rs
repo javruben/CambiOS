@@ -515,6 +515,67 @@ pub fn rdtsc() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// TUNING: hardware RNG attempts before reporting exhaustion. Intel's
+/// DRNG guide treats 10 consecutive RDRAND failures as a hardware fault;
+/// RDSEED can underflow transiently, so it falls back to RDRAND.
+/// Replace when: a measured exhaustion rate says otherwise.
+const RNG_RETRIES: u32 = 10;
+
+/// One 64-bit value from the CPU's generator: RDSEED (a conditioned
+/// entropy source) when CPUID reports it, else RDRAND (a DRBG reseeded
+/// from that source). `get_entropy` (syscall 76) is the only caller.
+pub fn hw_random_u64() -> Result<u64, super::EntropyError> {
+    let max_leaf = core::arch::x86_64::__cpuid(0).eax;
+    let rdseed = max_leaf >= 7 && core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 18) != 0;
+    let rdrand = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
+    if !rdseed && !rdrand {
+        return Err(super::EntropyError::Unsupported);
+    }
+    for _ in 0..RNG_RETRIES {
+        if rdseed {
+            let (v, ok): (u64, u8);
+            // SAFETY: CPUID.(EAX=7,ECX=0):EBX[18] reports RDSEED. It
+            // writes the destination register and CF (set on success);
+            // no memory is touched.
+            unsafe {
+                core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack));
+            }
+            if ok != 0 {
+                return Ok(v);
+            }
+        }
+        if rdrand {
+            let (v, ok): (u64, u8);
+            // SAFETY: CPUID.01H:ECX[30] reports RDRAND. Same contract as
+            // RDSEED above: destination register and CF only.
+            unsafe {
+                core::arch::asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack));
+            }
+            if ok != 0 {
+                return Ok(v);
+            }
+        }
+        core::hint::spin_loop();
+    }
+    Err(super::EntropyError::Exhausted)
+}
+
+#[cfg(test)]
+mod entropy_tests {
+    /// Runs the real instruction on the test host. Two draws that agree
+    /// would be a 2^-64 event, so equality means the path is broken
+    /// (for example a stubbed zero). A host without RDRAND/RDSEED must
+    /// say so rather than return bytes.
+    #[test]
+    fn hw_random_u64_draws_differ_or_reports_unsupported() {
+        match (super::hw_random_u64(), super::hw_random_u64()) {
+            (Ok(a), Ok(b)) => assert_ne!(a, b),
+            (Err(super::super::EntropyError::Unsupported), Err(super::super::EntropyError::Unsupported)) => {}
+            other => panic!("inconsistent generator results: {other:?}"),
+        }
+    }
+}
+
 /// Kick `cpu` so a task just woken onto its scheduler runs now rather
 /// than at that CPU's next timer tick. No-op for the calling CPU, for
 /// a CPU index past the online count, and before the APs are up (the

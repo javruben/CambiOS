@@ -8,15 +8,47 @@
 # source verbatim via #[path], so the proofs cover the live code; the job is
 # just `cd verification/<crate> && cargo kani`, exactly as the Makefile does.
 #
-# Path-gated. A proof's only inputs are the single kernel file it #[path]-
-# includes plus the proof crate's own harnesses/stubs under verification/, so
-# nothing else needs to re-verify. The `changes` job detects whether any
-# proof-relevant path changed; the `kani` matrix jobs ALWAYS run (they are
-# required status checks, so they must always report a conclusion) but skip the
-# expensive `setup` + `cargo kani` steps when nothing relevant changed,
-# reporting success as a no-op. A workflow-level `paths:` filter would skip the
-# jobs ENTIRELY, leaving the six required checks pending forever and blocking
-# every unrelated PR — hence the in-job gate instead.
+# A seventh matrix entry verifies cambios-netcore, the network stack's pure
+# protocol core (ADR-039 § 6.1). Its harnesses live in the crate itself under
+# #[cfg(kani)]; the job is `cd cambios-netcore && cargo kani -Z stubbing`
+# (its parser proofs are assume-guarantee compositions that stub separately
+# proven stages). Its .cargo/config.toml selects the developer's macOS
+# triple, so the job overrides the build target for the Linux runner.
+#
+# Two things run no matter what changed, because a green check must mean the
+# proofs were at least compiled:
+#   * `kani-codegen` compiles every crate under verification/, and
+#     cambios-netcore, on every push and pull request (`cargo kani
+#     --only-codegen`: harnesses included, no solver). A harness that no
+#     longer matches the kernel's signatures fails here even when the path
+#     filter below says nothing relevant changed. That is what happened on
+#     2026-09-15: `revoke` lost a parameter, capability-proofs stopped
+#     compiling, and the six solver checks reported success on every later
+#     run because they skipped.
+#   * A weekly scheduled run (and any manual dispatch) executes the full
+#     solve for all seven matrix entries, path filter ignored.
+#
+# The solver jobs are path-gated, per group. The `changes` job emits one
+# output per group:
+#   proofs   the six kernel proof crates. A proof's only inputs are the
+#            single kernel file it #[path]-includes plus the proof crate's own
+#            harnesses/stubs under verification/, so nothing else needs to
+#            re-verify.
+#   netcore  cambios-netcore. Inputs: its src/ (harnesses are in-crate), its
+#            manifest, lockfile and .cargo/config.toml. Not its tests/ and not
+#            spec/vectors/net/: `cargo kani` builds no integration tests, and no
+#            harness reads the vectors. Those are test inputs, covered by
+#            ci.yml's `test` job, which runs on every PR and push with no
+#            path filter.
+# The `kani` matrix jobs ALWAYS run (each must report a conclusion; the six
+# kernel ones are required status checks) but skip the expensive `setup` +
+# `cargo kani` steps when their own group did not change, reporting success
+# as a no-op. A workflow-level `paths:` filter would skip the jobs ENTIRELY,
+# leaving the six required checks pending forever and blocking every
+# unrelated PR — hence the in-job gate instead. Adding the cambios-netcore
+# entry does not change branch protection: whether `kani (cambios-netcore)`
+# is a required check is a repository setting, not something this file
+# configures.
 #
 # Per-crate input map (kept in lockstep with each crate's #[path] include):
 #   buddy-proofs       src/memory/buddy_allocator.rs
@@ -25,8 +57,10 @@
 #   capability-proofs  src/ipc/capability.rs
 #   userslice-proofs   src/syscalls/user_slice.rs
 #   dtb-proofs         src/boot/riscv.rs
-# A change to any of these (or to verification/ or this file) re-runs all six;
-# adding a proof crate means adding its #[path] file to the filter below.
+# A change to any of these (or to verification/) re-runs the six; a change to
+# cambios-netcore's inputs re-runs it alone; a change to this file re-runs all
+# seven. Adding a kernel proof crate means adding its #[path] file to the
+# `proofs` filter and a matrix entry below.
 #
 # Kani ships its own bundled toolchain + CBMC, independent of
 # rust-toolchain.toml. The pinned version below MUST match the version the
@@ -42,6 +76,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC: full solve, path filter ignored
 
 permissions:
   contents: read
@@ -64,11 +100,16 @@ jobs:
     name: detect proof-relevant changes
     runs-on: ubuntu-latest
     outputs:
-      proofs: ${{ steps.filter.outputs.proofs }}
+      proofs: ${{ steps.decide.outputs.proofs }}
+      netcore: ${{ steps.decide.outputs.netcore }}
     steps:
       - uses: actions/checkout@v4
+      # Only push and pull_request have a base to diff against; on a
+      # scheduled or dispatched run the filter is skipped and `decide`
+      # below answers for it.
       - uses: dorny/paths-filter@v3
         id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
         with:
           filters: |
             proofs:
@@ -80,17 +121,36 @@ jobs:
               - 'src/syscalls/user_slice.rs'
               - 'src/boot/riscv.rs'
               - '.github/workflows/proofs.yml'
+            netcore:
+              - 'cambios-netcore/src/**'
+              - 'cambios-netcore/Cargo.toml'
+              - 'cambios-netcore/Cargo.lock'
+              - 'cambios-netcore/.cargo/**'
+              - '.github/workflows/proofs.yml'
+      # A scheduled or manually dispatched run solves everything; only push
+      # and pull_request runs consult the path filter.
+      - name: Decide whether the solver runs
+        id: decide
+        run: |
+          case "${{ github.event_name }}" in
+            push|pull_request)
+              echo "proofs=${{ steps.filter.outputs.proofs }}" >> "$GITHUB_OUTPUT"
+              echo "netcore=${{ steps.filter.outputs.netcore }}" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "proofs=true" >> "$GITHUB_OUTPUT"
+              echo "netcore=true" >> "$GITHUB_OUTPUT" ;;
+          esac
 
   # ---------------------------------------------------------------------------
   # Prime the Kani install (verifier binaries + bundled toolchain/CBMC) into a
-  # version-keyed cache so the six matrix jobs restore it rather than each
-  # doing the full download. No checkout needed -- this job only installs Kani.
-  # Skipped entirely when no proof-relevant path changed (not a required check).
+  # version-keyed cache so the matrix jobs restore it rather than each doing
+  # the full download. No checkout needed -- this job only installs Kani.
+  # Skipped entirely when neither group changed (not a required check).
   # ---------------------------------------------------------------------------
   setup:
     name: setup kani
     needs: changes
-    if: needs.changes.outputs.proofs == 'true'
+    if: needs.changes.outputs.proofs == 'true' || needs.changes.outputs.netcore == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Cache Kani toolchain + verifier binaries
@@ -109,12 +169,86 @@ jobs:
           cargo kani setup
 
   # ---------------------------------------------------------------------------
-  # One job per proof crate. ALWAYS runs (these are required status checks, so
-  # each must report a conclusion on every PR) via `!cancelled()` — this also
-  # lets it run when `setup` was skipped. When proof-relevant paths changed it
+  # Compile every proof crate, every run, whatever changed. The crate list is
+  # the directory listing, not a copy of it, so a new crate under
+  # verification/ is compiled here without touching this file.
+  # cambios-netcore keeps its harnesses in-crate rather than under
+  # verification/, so it gets its own step after the loop. No path gate
+  # and no dependency on `changes` or `setup`: this job is the floor under
+  # the path-gated solver jobs below. When the Kani cache is cold (the
+  # `setup` job was skipped) the install step pays for it once.
+  #
+  # Not yet a required status check: adding its name to branch protection is
+  # a repository setting, changed by the maintainer after it has run green.
+  # ---------------------------------------------------------------------------
+  kani-codegen:
+    name: kani-codegen (every proof crate compiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Kani toolchain + verifier binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+      - name: Ensure Kani present (no-op on cache hit)
+        run: |
+          if ! command -v cargo-kani >/dev/null; then
+            ( cd "$HOME" && cargo install --locked kani-verifier@${KANI_VERSION} )
+          fi
+          cargo kani setup
+      - name: cargo kani --only-codegen (every crate under verification/)
+        run: |
+          set -e
+          for crate in verification/*-proofs; do
+            echo "::group::$crate"
+            ( cd "$crate" && cargo kani --only-codegen )
+            echo "::endgroup::"
+          done
+      - name: cargo kani --only-codegen (cambios-netcore)
+        working-directory: cambios-netcore
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: cargo kani --only-codegen -Z stubbing
+
+  # ---------------------------------------------------------------------------
+  # One job per proof crate. ALWAYS runs (each must report a conclusion on
+  # every PR; the six kernel ones are required status checks) via
+  # `!cancelled()` — this also lets it run when `setup` was skipped. When its
+  # group's paths changed (`matrix.group` names the `changes` output) it
   # restores the primed cache and runs the harnesses; otherwise it reports
-  # success as a no-op. fail-fast off so one regression still reports the other
-  # five.
+  # success as a no-op. fail-fast off so one regression still reports the
+  # others.
+  #
+  # cambios-netcore runs a named harness list, not every harness. Five
+  # harnesses do not finish on a hosted runner and run only on a large host:
+  #   checksum  p6_checksum_add_bytes_is_total_up_to_frame  (OOM at 3.5 GiB)
+  #   checksum  p6_checksum_is_total_up_to_frame            (timeout 1800 s)
+  #   engine    p6_step_on_any_small_frame_is_total         (timeout 1800 s at 16 GiB)
+  #   dhcpv4    p6_dhcpv4_parse_is_total                    (OOM at 3.5 GiB)
+  #   tcp       p6_tcp_options_walk_is_total                (timeout 600 s; OOM at 6 GiB)
+  # On 2026-11-12 the job was cancelled 7 minutes into the first of them
+  # ("The runner has received a shutdown signal", cause unknown), with no
+  # verdict for any harness. A green `kani (cambios-netcore)` covers
+  # the listed harnesses only; spec/claims/net.md records the large-host
+  # verdicts. `--harness` matches by substring, so each name below must not
+  # occur inside one of the five.
+  # The engine harness, even with `TxRing::push` replaced by its proven
+  # stand-in, was cancelled after 24 minutes on 2026-11-12 (run 43292730141
+  # on 59670a7: "The runner has received a shutdown signal", cause unknown,
+  # no verdict), so it stays off CI.
+  # Revisit when: each of the five has a recorded large-host verdict and
+  # either fits a hosted runner (move it into the list) or a self-hosted
+  # large runner exists for a second netcore entry.
+  #
+  # Matrix fields: `crate` is the check name, `kani (<crate>)`, unchanged for
+  # the six kernel crates; `dir` is where `cargo kani` runs; `args` are extra
+  # Kani flags; `build_target`, when set, overrides a crate-local
+  # `.cargo/config.toml` build target.
   # ---------------------------------------------------------------------------
   kani:
     name: kani (${{ matrix.crate }})
@@ -125,21 +259,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate:
-          - buddy-proofs
-          - elf-proofs
-          - frame-proofs
-          - capability-proofs
-          - userslice-proofs
-          - dtb-proofs
+        include:
+          - { crate: buddy-proofs, group: proofs, dir: verification/buddy-proofs, args: '', build_target: '' }
+          - { crate: elf-proofs, group: proofs, dir: verification/elf-proofs, args: '', build_target: '' }
+          - { crate: frame-proofs, group: proofs, dir: verification/frame-proofs, args: '', build_target: '' }
+          - { crate: capability-proofs, group: proofs, dir: verification/capability-proofs, args: '', build_target: '' }
+          - { crate: userslice-proofs, group: proofs, dir: verification/userslice-proofs, args: '', build_target: '' }
+          - { crate: dtb-proofs, group: proofs, dir: verification/dtb-proofs, args: '', build_target: '' }
+          - { crate: cambios-netcore, group: netcore, dir: cambios-netcore, args: '-Z stubbing --harness siphash24_is_total --harness p1_acceptable_is_translation_invariant --harness p1_acceptable_matches_rfc9293_table --harness p8_sendable_stays_inside_both_windows --harness edges_equal_transitions_membership --harness p2_close_takes_one_table_edge --harness p2_reach2_is_the_two_edge_closure --harness p2_segment_from_ --harness p3_exact_rst_closes --harness p3_non_exact_rst_changes_nothing --harness p4_syn_in_synchronized_state_is_challenged --harness p6_arp_parse_is_total --harness p6_classify_is_total_up_to_1514 --harness p6_ipv4_parse_is_total --harness p6_icmpv4_parse_is_total --harness p6_tcp_parse_is_total --harness p6_udp_parse_is_total --harness p6_tx_ring_push_', build_target: x86_64-unknown-linux-gnu }
     steps:
       - name: No proof-relevant changes — skip (report success)
-        if: needs.changes.outputs.proofs != 'true'
+        if: needs.changes.outputs[matrix.group] != 'true'
         run: echo "No proof-relevant paths changed; skipping Kani for ${{ matrix.crate }}."
       - uses: actions/checkout@v4
-        if: needs.changes.outputs.proofs == 'true'
+        if: needs.changes.outputs[matrix.group] == 'true'
       - name: Restore Kani toolchain + verifier binaries
-        if: needs.changes.outputs.proofs == 'true'
+        if: needs.changes.outputs[matrix.group] == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -148,13 +283,21 @@ jobs:
             ~/.cargo/bin/cargo-kani
           key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
       - name: Ensure Kani present (no-op on cache hit)
-        if: needs.changes.outputs.proofs == 'true'
+        if: needs.changes.outputs[matrix.group] == 'true'
         run: |
           if ! command -v cargo-kani >/dev/null; then
             ( cd "$HOME" && cargo install --locked kani-verifier@${KANI_VERSION} )
           fi
           cargo kani setup
       - name: cargo kani
-        if: needs.changes.outputs.proofs == 'true'
-        working-directory: verification/${{ matrix.crate }}
-        run: cargo kani
+        if: needs.changes.outputs[matrix.group] == 'true'
+        working-directory: ${{ matrix.dir }}
+        env:
+          KANI_ARGS: ${{ matrix.args }}
+          KANI_BUILD_TARGET: ${{ matrix.build_target }}
+        run: |
+          if [ -n "$KANI_BUILD_TARGET" ]; then
+            export CARGO_BUILD_TARGET="$KANI_BUILD_TARGET"
+          fi
+          # Word-splitting of KANI_ARGS is intended (flag list).
+          cargo kani $KANI_ARGS
