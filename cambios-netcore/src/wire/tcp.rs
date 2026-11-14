@@ -353,4 +353,109 @@ pub(crate) mod proofs {
             assert!(s.payload.len() + MIN_HEADER_LEN <= len);
         }
     }
+
+    /// SCAFFOLDING: widest payload in the `emit_ipv4` contract proof.
+    /// Why: the engine harness's whole send store is 16 octets, so no
+    /// segment it emits carries more; `emit_ipv4`'s fill, copy and checksum
+    /// are per octet, so the solver cost grows with this bound.
+    /// Replace when: an engine harness uses a wider store, or `emit_ipv4`
+    /// changes.
+    pub(crate) const EMIT_PAYLOAD_MAX: usize = 16;
+
+    /// SCAFFOLDING: widest `out` in this emitter's contract proof and stand-in.
+    /// Why: `frame` hands each emitter `out` cut to what it writes (at most
+    /// 40 octets), so 64 covers every call; a 1514-octet `out` exhausted
+    /// CBMC's memory (OOM at 24 GiB, seat m5090-5529).
+    /// Replace when: an emitter is called with a wider buffer.
+    pub(crate) const OUT_MAX: usize = 64;
+
+    /// The result `emit_ipv4` must return, from the inputs alone: `TooLong`
+    /// when the segment length overflows or does not fit 16 bits, else
+    /// `BufferTooSmall` when `out` is shorter than the segment, else the
+    /// segment length.
+    fn emit_expected(repr: &TcpRepr, payload_len: usize, out_len: usize) -> Result<usize, EmitError> {
+        let total = repr.header_len().checked_add(payload_len).ok_or(EmitError::TooLong)?;
+        if total > usize::from(u16::MAX) {
+            return Err(EmitError::TooLong);
+        }
+        if out_len < total {
+            return Err(EmitError::BufferTooSmall);
+        }
+        Ok(total)
+    }
+
+    /// Stand-in for `emit_ipv4` in the engine harness (owner approval
+    /// 2026-11-14).
+    ///
+    /// Contract (proved for `emit_ipv4` by
+    /// `p6_tcp_emit_ipv4_meets_its_contract`, for any header fields and
+    /// addresses, any payload up to `EMIT_PAYLOAD_MAX` = 16 octets and any
+    /// `out` up to `OUT_MAX` = 64 octets):
+    /// - the return value is exactly [`emit_expected`];
+    /// - on `Ok(total)`, only `out[..total]` may change; on `Err`, nothing
+    ///   changes;
+    /// - `emit_ipv4` never panics.
+    ///
+    /// The stand-in keeps the first point exactly and writes arbitrary
+    /// octets into `out[..total]` on `Ok`, so it allows every outcome
+    /// `emit_ipv4` can produce, and more.
+    pub(crate) fn emit_ipv4_stub(
+        repr: &TcpRepr,
+        payload: &[u8],
+        _source: Ipv4Address,
+        _destination: Ipv4Address,
+        out: &mut [u8],
+    ) -> Result<usize, EmitError> {
+        // Proved for these widths only; asserted, not assumed, so a wider
+        // call fails the harness instead of being silently excluded.
+        assert!(payload.len() <= EMIT_PAYLOAD_MAX);
+        assert!(out.len() <= OUT_MAX);
+        let r = emit_expected(repr, payload.len(), out.len());
+        if let Ok(total) = r {
+            let any: [u8; MIN_HEADER_LEN + MSS_OPTION_LEN + EMIT_PAYLOAD_MAX] = kani::any();
+            assert!(total <= any.len());
+            if let (Some(dst), Some(src)) = (out.get_mut(..total), any.get(..total)) {
+                dst.copy_from_slice(src);
+            }
+        }
+        r
+    }
+
+    /// `emit_ipv4` meets the stand-in's contract for any header fields and
+    /// addresses, any payload of 0..=16 octets and any `out` of
+    /// 0..=`OUT_MAX` octets. Unwind 42: the longest segment is
+    /// 24 + 16 = 40 octets.
+    #[kani::proof]
+    #[kani::unwind(42)]
+    fn p6_tcp_emit_ipv4_meets_its_contract() {
+        let mut out: [u8; OUT_MAX] = kani::any();
+        let payload: [u8; EMIT_PAYLOAD_MAX] = kani::any();
+        let (n, d): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(n <= OUT_MAX && d <= EMIT_PAYLOAD_MAX);
+        let repr = TcpRepr {
+            source_port: kani::any(),
+            destination_port: kani::any(),
+            seq: SeqNum(kani::any()),
+            ack: SeqNum(kani::any()),
+            flags: TcpFlags(kani::any()),
+            window: kani::any(),
+            mss: if kani::any() { Some(kani::any()) } else { None },
+        };
+        let src = Ipv4Address(kani::any());
+        let dst = Ipv4Address(kani::any());
+        // One arbitrary position, chosen before the call; only its old
+        // octet is kept (copying the whole buffer exhausted CBMC's memory).
+        let p: usize = kani::any();
+        kani::assume(p < OUT_MAX);
+        let old_p = out[p];
+        let r = emit_ipv4(&repr, &payload[..d], src, dst, &mut out[..n]);
+        assert_eq!(r, emit_expected(&repr, d, n));
+        let written = match r {
+            Ok(len) => len,
+            Err(_) => 0,
+        };
+        if p >= written {
+            assert_eq!(out[p], old_p);
+        }
+    }
 }

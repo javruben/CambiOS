@@ -71,6 +71,20 @@ pub fn classify(frame: &[u8], mtu: u16) -> Result<Classified<'_>, ParseError> {
     }
 }
 
+/// `out[at..]`, cut to at most `len` octets: the region one emitter writes.
+///
+/// Each emitter writes only the first `len` octets it is given and checks
+/// the length itself, so a buffer shorter than `len` still gets that
+/// emitter's own error (`TooLong` before `BufferTooSmall`), as before the
+/// cut. The cut keeps every emitter's buffer as short as what it writes,
+/// which is what lets the emitter contract proofs (`*_meets_its_contract`,
+/// bounded to 64 octets) cover every call (owner approval 2026-11-14).
+fn window(out: &mut [u8], at: usize, len: usize) -> Result<&mut [u8], EmitError> {
+    let tail = out.get_mut(at..).ok_or(EmitError::BufferTooSmall)?;
+    let n = len.min(tail.len());
+    tail.get_mut(..n).ok_or(EmitError::BufferTooSmall)
+}
+
 /// Link and network addressing for one outgoing frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv4Route {
@@ -91,9 +105,9 @@ pub fn emit_ipv4_tcp(
 ) -> Result<usize, EmitError> {
     let ip_at = ethernet::HEADER_LEN;
     let tcp_at = ip_at.checked_add(ipv4::MIN_HEADER_LEN).ok_or(EmitError::TooLong)?;
-    let tcp_out = out.get_mut(tcp_at..).ok_or(EmitError::BufferTooSmall)?;
+    let tcp_out = window(out, tcp_at, segment.header_len().saturating_add(payload.len()))?;
     let tcp_len = tcp::emit_ipv4(segment, payload, route.source, route.destination, tcp_out)?;
-    let ip_out = out.get_mut(ip_at..).ok_or(EmitError::BufferTooSmall)?;
+    let ip_out = window(out, ip_at, ipv4::MIN_HEADER_LEN)?;
     ipv4::emit(
         &Ipv4Repr {
             source: route.source,
@@ -111,7 +125,7 @@ pub fn emit_ipv4_tcp(
 /// Write a complete Ethernet + ARP frame into `out`. Returns the frame
 /// length (42; the NIC pads to the Ethernet minimum).
 pub fn emit_arp(source_mac: MacAddress, destination_mac: MacAddress, packet: &ArpPacket, out: &mut [u8]) -> Result<usize, EmitError> {
-    let arp_out = out.get_mut(ethernet::HEADER_LEN..).ok_or(EmitError::BufferTooSmall)?;
+    let arp_out = window(out, ethernet::HEADER_LEN, arp::PACKET_LEN)?;
     let len = arp::emit(packet, arp_out)?;
     ethernet::emit_header(out, destination_mac, source_mac, EtherType::Arp)?;
     ethernet::HEADER_LEN.checked_add(len).ok_or(EmitError::TooLong)
@@ -139,7 +153,7 @@ pub fn emit_ipv4_icmp_echo(route: &Ipv4Route, echo: &Echo, data: &[u8], out: &mu
 /// Write the IPv4 and Ethernet headers in front of a `payload_len`-octet
 /// transport message already at `out[payload_at..]`.
 fn finish_ipv4(route: &Ipv4Route, protocol: u8, payload_at: usize, payload_len: usize, out: &mut [u8]) -> Result<usize, EmitError> {
-    let ip_out = out.get_mut(ethernet::HEADER_LEN..).ok_or(EmitError::BufferTooSmall)?;
+    let ip_out = window(out, ethernet::HEADER_LEN, ipv4::MIN_HEADER_LEN)?;
     ipv4::emit(
         &Ipv4Repr { source: route.source, destination: route.destination, protocol, ttl: route.ttl, payload_len },
         ip_out,
@@ -155,7 +169,7 @@ pub fn emit_ipv4_udp(route: &Ipv4Route, repr: &UdpRepr, payload: &[u8], out: &mu
     let udp_at = ip_at.checked_add(ipv4::MIN_HEADER_LEN).ok_or(EmitError::TooLong)?;
     let udp_out = out.get_mut(udp_at..).ok_or(EmitError::BufferTooSmall)?;
     let udp_len = udp::emit_ipv4(repr, payload, route.source, route.destination, udp_out)?;
-    let ip_out = out.get_mut(ip_at..).ok_or(EmitError::BufferTooSmall)?;
+    let ip_out = window(out, ip_at, ipv4::MIN_HEADER_LEN)?;
     ipv4::emit(
         &Ipv4Repr {
             source: route.source,

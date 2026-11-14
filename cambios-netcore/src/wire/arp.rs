@@ -94,9 +94,84 @@ pub fn emit(packet: &ArpPacket, out: &mut [u8]) -> Result<usize, EmitError> {
 ///
 /// P6 (INV-net-013): the ARP parser is total for every input of 0..=64
 /// octets (past the 28-octet packet and any Ethernet padding length).
+///
+/// [`proofs::emit_stub`] is the stand-in for [`emit`] in the engine
+/// harness (owner approval 2026-11-14); `p6_arp_emit_meets_its_contract`
+/// proves that `emit` keeps its contract.
 #[cfg(kani)]
-mod proofs {
+pub(crate) mod proofs {
     use super::*;
+
+    /// SCAFFOLDING: widest `out` in this emitter's contract proof and stand-in.
+    /// Why: `frame` hands each emitter `out` cut to what it writes (at most
+    /// 40 octets), so 64 covers every call; a 1514-octet `out` exhausted
+    /// CBMC's memory (OOM at 24 GiB, seat m5090-5529).
+    /// Replace when: an emitter is called with a wider buffer.
+    pub(crate) const OUT_MAX: usize = 64;
+
+    /// The result `emit` must return: the packet length when `out` holds
+    /// it, else `BufferTooSmall`.
+    fn expected(out_len: usize) -> Result<usize, EmitError> {
+        if out_len < PACKET_LEN {
+            Err(EmitError::BufferTooSmall)
+        } else {
+            Ok(PACKET_LEN)
+        }
+    }
+
+    /// Stand-in for `emit` in the engine harness.
+    ///
+    /// Contract (proved for `emit` by `p6_arp_emit_meets_its_contract`, for
+    /// any packet and any `out` up to `OUT_MAX` octets):
+    /// - the return value is exactly [`expected`];
+    /// - on `Ok`, only `out[..28]` may change; on `Err`, nothing changes;
+    /// - `emit` never panics.
+    ///
+    /// The stand-in keeps the first point exactly and writes arbitrary
+    /// octets into `out[..28]` on `Ok`, so it allows every outcome `emit`
+    /// can produce, and more.
+    pub(crate) fn emit_stub(_packet: &ArpPacket, out: &mut [u8]) -> Result<usize, EmitError> {
+        // Proved for `out` up to `OUT_MAX` only; asserted, not assumed.
+        assert!(out.len() <= OUT_MAX);
+        let r = expected(out.len());
+        if r.is_ok() {
+            let any: [u8; PACKET_LEN] = kani::any();
+            if let Some(p) = out.get_mut(..PACKET_LEN) {
+                p.copy_from_slice(&any);
+            }
+        }
+        r
+    }
+
+    /// `emit` meets the stand-in's contract for any packet and any `out` of
+    /// 0..=`OUT_MAX` octets.
+    #[kani::proof]
+    fn p6_arp_emit_meets_its_contract() {
+        let mut out: [u8; OUT_MAX] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= OUT_MAX);
+        let packet = ArpPacket {
+            operation: if kani::any() { ArpOperation::Request } else { ArpOperation::Reply },
+            sender_mac: MacAddress(kani::any()),
+            sender_ip: Ipv4Address(kani::any()),
+            target_mac: MacAddress(kani::any()),
+            target_ip: Ipv4Address(kani::any()),
+        };
+        // One arbitrary position, chosen before the call; only its old
+        // octet is kept (copying the whole buffer exhausted CBMC's memory).
+        let p: usize = kani::any();
+        kani::assume(p < OUT_MAX);
+        let old_p = out[p];
+        let r = emit(&packet, &mut out[..n]);
+        assert_eq!(r, expected(n));
+        let written = match r {
+            Ok(len) => len,
+            Err(_) => 0,
+        };
+        if p >= written {
+            assert_eq!(out[p], old_p);
+        }
+    }
 
     /// SCAFFOLDING: input length for the ARP parser harness.
     /// Why: exceeds the 28-octet packet and the 46-octet minimum Ethernet

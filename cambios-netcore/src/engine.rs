@@ -2041,7 +2041,11 @@ fn rebase(d: Delivery, ip: &Ipv4Packet<'_>, seg: &TcpSegment<'_>) -> Option<Deli
 /// `MAX_ACTIONS_PER_STEP` actions come back and any emitted frame fits the
 /// transmit buffer. The TCP option walk and the checksum accumulator are
 /// replaced by the sound over-approximating stubs that the parser proofs
-/// establish (see `wire::frame::proofs`).
+/// establish (see `wire::frame::proofs`). `TxRing::push` and the IPv4, TCP
+/// and ARP emitters (`wire::ipv4::emit`, `wire::tcp::emit_ipv4`,
+/// `wire::arp::emit`; owner approval 2026-11-14) are replaced by stand-ins
+/// whose contracts are proved for the real functions by the
+/// `*_meets_its_contract` harnesses. The UDP and ICMP emitters stay real.
 ///
 /// 42 octets is a full Ethernet + ARP frame and covers every Ethernet and
 /// IPv4 header boundary; it does not reach a TCP header, so TCP options and
@@ -2184,6 +2188,9 @@ mod proofs {
     #[kani::stub(crate::checksum::Checksum::add_bytes, crate::checksum::proofs::add_bytes_stub)]
     #[kani::stub(crate::checksum::Checksum::verifies, crate::checksum::proofs::verifies_stub)]
     #[kani::stub(TxRing::push, tx_ring_push_stub)]
+    #[kani::stub(crate::wire::ipv4::emit, crate::wire::ipv4::proofs::emit_stub)]
+    #[kani::stub(crate::wire::tcp::emit_ipv4, crate::wire::tcp::proofs::emit_ipv4_stub)]
+    #[kani::stub(crate::wire::arp::emit, crate::wire::arp::proofs::emit_stub)]
     #[kani::unwind(70)]
     fn p6_step_on_any_small_frame_is_total() {
         let mut store = [0u8; 16];
