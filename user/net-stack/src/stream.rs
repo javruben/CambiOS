@@ -232,16 +232,19 @@ impl Stream {
             _ if self.ep.attach_overdue(self.opened, now, ATTACH_MS) => Peer::Gone,
             _ => self.judged(),
         };
-        // Credit only forward progress within the ring: a client that
-        // moves its tail backwards (it may write its page at will) gets
-        // no window for it.
-        let tail = self.ep.peer_tail();
-        let advance = tail.wrapping_sub(self.credited);
-        let freed = if advance <= CAPACITY && self.ep.unread() <= CAPACITY {
-            self.credited = tail;
-            advance
-        } else {
-            0
+        // Credit only forward progress: a client that moves its tail
+        // backwards (it may write its page at will) gets no window for it.
+        // Honest progress since the last credit can exceed one ring,
+        // because `deliver` refills the ring each time the client drains
+        // it between two passes. Bounding the credit by CAPACITY froze
+        // `credited` for good once that happened: the receive window never
+        // reopened (the echo stall, sent - got = 32768 = both rings).
+        let freed = match self.ep.consumed_since(self.credited) {
+            Some(n) => {
+                self.credited = self.ep.peer_tail();
+                n
+            }
+            None => 0,
         };
         (freed, peer)
     }

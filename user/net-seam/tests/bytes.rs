@@ -121,6 +121,39 @@ fn peek_does_not_consume_and_consume_is_bounded_by_peek() {
 }
 
 #[test]
+fn consumed_since_counts_progress_beyond_one_ring() {
+    // The peer drains a full ring, we refill it, it drains again, all
+    // before we look: 32 octets of honest progress through a 16-octet ring.
+    let (mut a, mut b, mut ea, mut eb) = pair(16);
+    let mark = ea.peer_tail();
+    let mut out = [0u8; 16];
+    assert_eq!(ea.write(&mut a[..], &b[..], &pattern(16, 1)), Ok(16));
+    assert_eq!(eb.read(&mut b[..], &a[..], &mut out), Ok(16));
+    assert_eq!(ea.write(&mut a[..], &b[..], &pattern(16, 2)), Ok(16));
+    assert_eq!(eb.read(&mut b[..], &a[..], &mut out), Ok(16));
+    assert_eq!(ea.write(&mut a[..], &b[..], &[]), Ok(0)); // look at the peer's page
+    assert_eq!(ea.consumed_since(mark), Some(32));
+    assert_eq!(ea.consumed_since(ea.peer_tail()), Some(0));
+    assert_eq!(ea.violations(), 0);
+}
+
+#[test]
+fn consumed_since_refuses_a_tail_that_moved_backwards() {
+    let (mut a, mut b, mut ea, mut eb) = pair(16);
+    let mut out = [0u8; 8];
+    assert_eq!(ea.write(&mut a[..], &b[..], &pattern(8, 4)), Ok(8));
+    assert_eq!(eb.read(&mut b[..], &a[..], &mut out), Ok(8));
+    assert_eq!(ea.write(&mut a[..], &b[..], &[]), Ok(0));
+    let mark = ea.peer_tail();
+    assert_eq!(mark, 8);
+    // Still inside the ring, so the write path accepts it, but behind the mark.
+    write_u32(&mut b, layout::PEER_TAIL, 4);
+    assert_eq!(ea.write(&mut a[..], &b[..], &[]), Ok(0));
+    assert_eq!(ea.peer_tail(), 4);
+    assert_eq!(ea.consumed_since(mark), None);
+}
+
+#[test]
 fn peer_not_attached_then_attached_then_gone() {
     let n = layout::CONTROL_LEN + 16;
     let mut a = vec![0u8; n];

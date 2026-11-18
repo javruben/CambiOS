@@ -209,6 +209,24 @@ impl ByteEndpoint {
         self.head.wrapping_sub(self.peer_tail)
     }
 
+    /// Octets the peer consumed since `mark`, an earlier [`peer_tail`]
+    /// value, as of the last operation that read its page. `None` if its
+    /// tail is now behind `mark` (it moved backwards).
+    ///
+    /// The bound is everything we wrote since `mark`, not the ring's
+    /// capacity: between two looks the peer may drain and we may refill the
+    /// ring more than once, so honest progress can exceed one ring.
+    ///
+    /// [`peer_tail`]: ByteEndpoint::peer_tail
+    pub const fn consumed_since(&self, mark: u32) -> Option<u32> {
+        let advance = self.peer_tail.wrapping_sub(mark);
+        if advance <= self.head.wrapping_sub(mark) {
+            Some(advance)
+        } else {
+            None
+        }
+    }
+
     /// The peer's octets not yet consumed, as of the last `peek` (less
     /// any `consume` since).
     pub const fn available(&self) -> u32 {
