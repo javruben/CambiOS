@@ -388,6 +388,15 @@ pub const HEAP_SIZE: u64 = 0x400000;
 /// Number of 4 KiB frames in a process heap (4 MiB / 4 KiB = 1024).
 pub const HEAP_PAGES: usize = (HEAP_SIZE / PAGE_SIZE) as usize;
 
+/// ARCHITECTURAL: byte offset of the scratch frame inside a process heap
+/// (ADR-007 Divergence entry 8): the first page boundary at or after the
+/// in-place `BuddyAllocator`. The allocator's reserved prefix covers it,
+/// so it is never handed out as user memory.
+pub const SCRATCH_OFFSET: usize =
+    core::mem::size_of::<BuddyAllocator>().div_ceil(PAGE_SIZE as usize) * PAGE_SIZE as usize;
+
+const _: () = assert!(SCRATCH_OFFSET + (PAGE_SIZE as usize) < HEAP_SIZE as usize);
+
 /// Errors from `ProcessDescriptor::new` — today, only heap allocation
 /// can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +459,17 @@ pub struct ProcessDescriptor {
     /// ARCHITECTURAL: `MAX_ENDPOINTS` (64) is exactly one `u64` of bits;
     /// the assertion below pins that.
     pub registered_endpoints: u64,
+    /// Physical address of this process's scratch frame (ADR-007
+    /// Divergence entry 8, ADR-039 § 9): one zeroed 4 KiB frame owned by
+    /// the process alone. When a channel is torn down, every page of this
+    /// process's *writable* mapping of it is remapped here, so a write
+    /// racing the revoke sinks into memory only this process can see
+    /// instead of faulting. 0 = none (host-test descriptors).
+    /// It is the first whole page after the in-place `BuddyAllocator`,
+    /// inside the allocator's reserved prefix (see
+    /// [`ProcessDescriptor::new`]), so it is never handed out as user
+    /// memory and is freed with the heap.
+    pub scratch_phys: u64,
 }
 
 const _: () = assert!(crate::ipc::MAX_ENDPOINTS <= 64);
@@ -522,11 +542,29 @@ impl ProcessDescriptor {
         // SAFETY: virt_base is a freshly allocated, page-aligned,
         // HHDM-mapped region of HEAP_SIZE bytes (>> size_of::<BuddyAllocator>()).
         // We are the exclusive owner of those frames.
+        //
+        // The reserved prefix also covers the scratch frame (ADR-007
+        // Divergence entry 8): the first whole page after the allocator's
+        // own state. Taking it from the heap rather than as a separate
+        // frame-allocator allocation keeps physical layout unchanged: an
+        // extra per-process frame from the frame allocator was observed to
+        // stall the boot wave after policy-service readiness on every KVM
+        // boot (build1-3571, experiments A and C), root cause not yet
+        // found.
         unsafe {
-            BuddyAllocator::init_at(
-                virt_base as *mut BuddyAllocator,
-                core::mem::size_of::<BuddyAllocator>(),
-            );
+            BuddyAllocator::init_at(virt_base as *mut BuddyAllocator, SCRATCH_OFFSET + PAGE_SIZE as usize);
+        }
+        let scratch_phys = phys_base + SCRATCH_OFFSET as u64;
+
+        // Zero the scratch frame so the first thing a survivor reads after
+        // a revoke is zeros, never a previous owner's data.
+        // SAFETY: `virt_base + SCRATCH_OFFSET .. + PAGE_SIZE` lies inside
+        // the heap just allocated (SCRATCH_OFFSET + PAGE_SIZE << HEAP_SIZE,
+        // asserted at the constant), HHDM-mapped and exclusively ours; it
+        // does not overlap the allocator state, which ends at or before
+        // SCRATCH_OFFSET; nothing maps it yet.
+        unsafe {
+            core::ptr::write_bytes((virt_base + SCRATCH_OFFSET as u64) as *mut u8, 0, PAGE_SIZE as usize);
         }
 
         Ok(ProcessDescriptor {
@@ -537,6 +575,7 @@ impl ProcessDescriptor {
             vma: VmaTracker::new(),
             fds: FdTable::new(),
             registered_endpoints: 0,
+            scratch_phys,
         })
     }
 
@@ -1046,7 +1085,7 @@ impl ProcessTable {
             // `None` when cr3 == 0 (kernel task, no per-process table).
             let deferred_root = if desc.cr3 != 0 { Some(desc.cr3) } else { None };
 
-            // Step 3: Reclaim the heap region.
+            // Step 3: Reclaim the heap region (the scratch frame is part of it).
             let _ = desc.reclaim_heap(frame_alloc);
 
             // Step 4: Increment generation so the next occupant of this
@@ -1074,6 +1113,16 @@ impl ProcessTable {
     /// whose slot has been reused reports `false`.
     pub fn slot_occupied(&self, process_id: ProcessId) -> bool {
         self.resolve(process_id).is_some()
+    }
+
+    /// The physical address of a process's scratch frame (ADR-007
+    /// Divergence entry 8). 0 for a stale / unknown `process_id` or a
+    /// process without one; callers then fall back to unmapping.
+    pub fn scratch_phys(&self, process_id: ProcessId) -> u64 {
+        match self.resolve(process_id) {
+            Some(idx) => self.processes[idx].as_ref().map(|p| p.scratch_phys).unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// Get mutable access to a process's VMA tracker. `None` for a stale /
@@ -1283,7 +1332,23 @@ mod tests {
             vma: VmaTracker::new(),
             fds: FdTable::new(),
             registered_endpoints: 0,
+            scratch_phys: 0,
         }
+    }
+
+    /// The scratch frame (ADR-007 Divergence entry 8) is a whole page,
+    /// after the allocator's own state, inside the heap, and inside the
+    /// reserved prefix the allocator never hands out.
+    #[test]
+    fn scratch_frame_is_a_reserved_page_after_the_allocator() {
+        let page = PAGE_SIZE as usize;
+        assert_eq!(SCRATCH_OFFSET % page, 0);
+        assert!(SCRATCH_OFFSET >= core::mem::size_of::<BuddyAllocator>());
+        assert!(SCRATCH_OFFSET - core::mem::size_of::<BuddyAllocator>() < page);
+        assert!(SCRATCH_OFFSET + page < HEAP_SIZE as usize);
+        let mut a = BuddyAllocator::new_with_reserved_prefix(SCRATCH_OFFSET + page);
+        let first = a.allocate(crate::memory::buddy_allocator::MIN_SIZE).expect("a free slot");
+        assert!(first.offset >= SCRATCH_OFFSET + page, "user memory overlaps the scratch frame");
     }
 
     #[test]

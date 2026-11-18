@@ -4,7 +4,7 @@
 <!-- Source of truth: cambios-abi/src/audit.rs (the `audit_taxonomy!` macro). -->
 <!-- ADR-007 carries the categories and rationale; this file is the enumeration. -->
 
-**Taxonomy version:** 1
+**Taxonomy version:** 2
 
 Each kernel audit event is a 64-byte `RawAuditEvent`. Byte 0 is the
 discriminant (`disc`) below; the flags byte (byte 1) carries the sampled
@@ -43,3 +43,4 @@ security, dataflow, lifecycle, anomaly, meta, context
 | 20 | `chan.teardown.completed` | lifecycle | subject=completer object=channel arg0=teardown_kind(0=Close,1=Revoke) arg1=num_pages |
 | 21 | `meta.reap_would_free_active_root` | meta | subject=0(kernel) arg0=active_root_phys |
 | 22 | `proc.faulted` | lifecycle | subject=pid arg0=fault_kind arg1=fault_addr arg2=pc arg3=runtime_ticks |
+| 23 | `chan.peer_violation` | security | subject=closer object=channel arg0=accused_pid |

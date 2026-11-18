@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-netcore"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "The clean-room pure protocol core of the CambiOS network stack: bounded wire parsers and emitters, RFC 9293 sequence arithmetic, and the per-connection TCP transition function. No I/O, no allocation, no unsafe; the effects live in the stack shell."
+
+[lib]
+path = "src/lib.rs"
+
+# A standalone crate, excluded from the kernel workspace (root
+# Cargo.toml `exclude`). The empty table stops cargo's upward workspace
+# search here, so the crate also builds from a git worktree nested inside
+# another checkout (`.claude/worktrees/...`), where the search would
+# otherwise reach the outer checkout's workspace.
+[workspace]
+
+# No runtime dependencies (ADR-039 § 5.1 and § 11): the egress trust
+# boundary contains no code the project did not write.
+[dependencies]
+
+# Host-only, test-only: reads the language-neutral conformance vectors
+# under spec/vectors/net/. Never reachable from a `*-unknown-none` build.
+[dev-dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

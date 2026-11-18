@@ -343,6 +343,14 @@ audit_taxonomy! {
     /// specific with the raw code in bits 8..16).
     ProcessFaulted = 22 => "proc.faulted", Lifecycle,
         "subject=pid arg0=fault_kind arg1=fault_addr arg2=pc arg3=runtime_ticks";
+
+    /// A channel holder closed the link because the other side broke the
+    /// ring protocol (`SYS_CHANNEL_CLOSE` with
+    /// `CHANNEL_CLOSE_REASON_PEER_VIOLATION`, ADR-039 § 4). Emitted just
+    /// before the matching `chan.closed`. The kernel cannot check the
+    /// claim: this records who accused whom, not that the accused lied.
+    ChannelPeerViolation = 23 => "chan.peer_violation", Security,
+        "subject=closer object=channel arg0=accused_pid";
 }
 
 /// Number of assigned audit event kinds. Derived from [`TAXONOMY`] —
@@ -358,7 +366,7 @@ pub const AUDIT_EVENT_KIND_COUNT: usize = TAXONOMY.len();
 /// grow monotonically as the taxonomy evolves. The append-only
 /// discriminant rule (see module docs) is the structural guarantee;
 /// this version is the advisory hint.
-pub const AUDIT_TAXONOMY_VERSION: u16 = 1;
+pub const AUDIT_TAXONOMY_VERSION: u16 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -373,7 +381,8 @@ mod tests {
         assert_eq!(AuditEventKind::InputFocusChange as u8, 16);
         assert_eq!(AuditEventKind::ReapWouldFreeActiveRoot as u8, 21);
         assert_eq!(AuditEventKind::ProcessFaulted as u8, 22);
-        assert_eq!(AUDIT_EVENT_KIND_COUNT, 23);
+        assert_eq!(AuditEventKind::ChannelPeerViolation as u8, 23);
+        assert_eq!(AUDIT_EVENT_KIND_COUNT, 24);
     }
 
     /// TAXONOMY is dense and ordered: entry `i` has discriminant `i`,
@@ -462,6 +471,6 @@ mod tests {
 
     #[test]
     fn version_is_pinned() {
-        assert_eq!(AUDIT_TAXONOMY_VERSION, 1);
+        assert_eq!(AUDIT_TAXONOMY_VERSION, 2);
     }
 }

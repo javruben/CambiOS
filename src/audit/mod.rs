@@ -400,6 +400,34 @@ impl RawAuditEvent {
         )
     }
 
+    /// `CHANNEL_PEER_VIOLATION`: a holder closed the channel because the
+    /// other side broke the ring protocol (ADR-039 § 4). Emitted just
+    /// before the matching `chan.closed`; an unchecked accusation.
+    ///
+    /// - `subject_pid`: the closer (the accuser)
+    /// - `object_id`: channel id
+    /// - `arg0`: the accused side's raw `ProcessId`, 0 if it never attached
+    pub fn channel_peer_violation(
+        closer: ProcessId,
+        channel_id: u64,
+        accused: Option<ProcessId>,
+        timestamp: u64,
+        sequence: u32,
+    ) -> Self {
+        Self::build(
+            AuditEventKind::ChannelPeerViolation,
+            0,
+            sequence,
+            timestamp,
+            closer.as_raw(),
+            channel_id,
+            accused.map_or(0, |p| p.as_raw()),
+            0,
+            0,
+            0,
+        )
+    }
+
     /// `CHANNEL_TEARDOWN_STARTED`: after `begin_teardown` on `Active`.
     ///
     /// - `subject_pid`: the endpoint that initiated teardown
@@ -980,6 +1008,20 @@ mod tests {
         assert_eq!(e.kind(), AuditEventKind::ChannelClosed as u8);
         assert_eq!(e.arg0(), 65536); // bytes_transferred
         assert_eq!(u64::from_le_bytes(e.data[40..48].try_into().unwrap()), 1000); // lifetime
+    }
+
+    #[test]
+    fn channel_peer_violation_builder() {
+        let closer = ProcessId::new(1, 0);
+        let accused = ProcessId::new(4, 2);
+        let e = RawAuditEvent::channel_peer_violation(closer, 0x0001_0005, Some(accused), 400, 4);
+
+        assert_eq!(e.kind(), AuditEventKind::ChannelPeerViolation as u8);
+        assert_eq!(e.object_id(), 0x0001_0005);
+        assert_eq!(e.arg0(), accused.as_raw());
+
+        let unattached = RawAuditEvent::channel_peer_violation(closer, 0x0001_0005, None, 400, 5);
+        assert_eq!(unattached.arg0(), 0);
     }
 
     #[test]

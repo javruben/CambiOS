@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Jason Ricca
+
+# Override the parent project's bare-metal kernel target so this crate
+# can be built and tested standalone (`cd cambios-netcore && cargo
+# test`). Same precedent as cambios-manifest/.cargo/config.toml: the
+# crate is `no_std` and architecture-agnostic, so the native host triple
+# links the test runner. Bare-metal builds pass `--target` explicitly.
+[build]
+target = "aarch64-apple-darwin"

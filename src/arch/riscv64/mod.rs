@@ -773,3 +773,13 @@ pub fn cpu_to_saved_context(cpu: &CpuContext, saved: &mut SavedContext) {
     saved.sepc    = cpu.pc;
     saved.sstatus = cpu.sstatus;
 }
+
+/// No hardware RNG path on riscv64: the Zkr `seed` CSR exists only on
+/// some harts, and S-mode may read it only when M-mode firmware sets
+/// `mseccfg.SSEED`; otherwise the read traps. `get_entropy` (syscall
+/// 76) therefore fails closed here.
+/// Revisit when: a supported riscv64 platform implements Zkr and its
+/// firmware grants S-mode seed access.
+pub fn hw_random_u64() -> Result<u64, super::EntropyError> {
+    Err(super::EntropyError::Unsupported)
+}

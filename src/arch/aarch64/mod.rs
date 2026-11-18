@@ -1310,3 +1310,46 @@ extern "C" fn yield_inner(current_sp: u64) -> u64 {
 
     new_sp
 }
+
+/// TUNING: RNDR attempts before reporting exhaustion. RNDR fails (sets
+/// Z) when it cannot produce a value in reasonable time; retrying is the
+/// architecture's remedy.
+/// Replace when: a measured exhaustion rate says otherwise.
+#[cfg(target_os = "none")]
+const RNG_RETRIES: u32 = 10;
+
+/// One 64-bit value from RNDR (FEAT_RNG), when ID_AA64ISAR0_EL1.RNDR
+/// reports it; `Unsupported` otherwise (QEMU's cortex-a72 has none).
+/// `get_entropy` (syscall 76) is the only caller.
+#[cfg(target_os = "none")]
+pub fn hw_random_u64() -> Result<u64, super::EntropyError> {
+    let isar0: u64;
+    // SAFETY: mrs of an ID register is a pure read at EL1; nomem +
+    // preserves_flags hold.
+    unsafe {
+        core::arch::asm!("mrs {0}, ID_AA64ISAR0_EL1", out(reg) isar0, options(nomem, nostack, preserves_flags));
+    }
+    if (isar0 >> 60) & 0xF == 0 {
+        return Err(super::EntropyError::Unsupported);
+    }
+    for _ in 0..RNG_RETRIES {
+        let (v, ok): (u64, u64);
+        // SAFETY: ID_AA64ISAR0_EL1.RNDR != 0 reports FEAT_RNG, so RNDR
+        // (s3_3_c2_c4_0) is implemented. It writes the destination
+        // register and NZCV (Z set on failure); no memory is touched.
+        unsafe {
+            core::arch::asm!("mrs {v}, s3_3_c2_c4_0", "cset {ok}, ne", v = out(reg) v, ok = out(reg) ok, options(nomem, nostack));
+        }
+        if ok != 0 {
+            return Ok(v);
+        }
+        core::hint::spin_loop();
+    }
+    Err(super::EntropyError::Exhausted)
+}
+
+/// Host-test stub: no generator off target.
+#[cfg(not(target_os = "none"))]
+pub fn hw_random_u64() -> Result<u64, super::EntropyError> {
+    Err(super::EntropyError::Unsupported)
+}

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (C) 2024-2026 Jason Ricca
+
+[package]
+name = "cambios-net-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "The network IPC contract of CambiOS (ADR-039 sections 2-3): endpoints, command and status bytes, and the fixed encodings of the NIC seam control (ep 20/36) and socket control (ep 34). Pure wire format; no transport, no rings, no protocol state."
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies beyond `core`: the NIC drivers, the stack and every
+# client depend on this crate; it depends on nothing.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

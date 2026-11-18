@@ -176,7 +176,7 @@ pub mod _capability_src;
 #[cfg(kani)]
 mod proofs {
     use super::ipc::capability::*;
-    use super::ipc::{CapabilityRights, EndpointId, Principal, ProcessId};
+    use super::ipc::{CapabilityRights, EndpointId, ProcessId};
     extern crate alloc;
     use alloc::boxed::Box;
 
@@ -512,32 +512,67 @@ mod proofs {
         );
     }
 
-    /// P3.12 — `revoke(holder, endpoint, revoker, bootstrap)` with
-    /// `revoker != bootstrap` returns `Err(AccessDenied)` and leaves the
-    /// holder's capability intact. The Phase 3.1 authority model
-    /// (bootstrap-only) is enforced before any table mutation.
+    /// P3.12 — `revoke(holder, endpoint, revoker)` returns
+    /// `Err(AccessDenied)` and leaves the holder's capability intact
+    /// whenever the revoker lacks the `revoke` right on `endpoint`:
+    /// it is unregistered, holds no capability for `endpoint`, or holds
+    /// one without `revoke`. A revoker that is the holder itself is
+    /// denied even when it holds `revoke`. Authority is checked before
+    /// any table mutation (src/ipc/capability.rs `revoke`).
     #[kani::proof]
     #[kani::unwind(5)]
-    fn proof_revoke_non_bootstrap_rejected() {
+    fn proof_revoke_without_revoke_right_rejected() {
         let mut mgr = make_manager(3);
         let holder = ProcessId::new(1, 0);
         let endpoint = EndpointId(7);
         mgr.register_process(holder).unwrap();
-        mgr.grant_capability(holder, endpoint, CapabilityRights::SEND_ONLY).unwrap();
+        let mut held = any_rights();
+        held.send = true;
+        mgr.grant_capability(holder, endpoint, held).unwrap();
 
-        let bootstrap = Principal::from_public_key([0xAA; 32]);
-        // Symbolic attacker principal, constrained to differ from bootstrap.
-        let attacker_byte: u8 = kani::any();
-        kani::assume(attacker_byte != 0xAA);
-        let attacker = Principal::from_public_key([attacker_byte; 32]);
+        // 0: the holder revokes itself; 1: unregistered revoker;
+        // 2: registered, no capability; 3: capability without `revoke`.
+        let case: u8 = kani::any();
+        kani::assume(case < 4);
+        let revoker = if case == 0 { holder } else { ProcessId::new(2, 0) };
+        if case >= 2 {
+            mgr.register_process(revoker).unwrap();
+        }
+        if case == 3 {
+            let mut rights = any_rights();
+            rights.revoke = false;
+            mgr.grant_capability(revoker, endpoint, rights).unwrap();
+        }
 
-        let result = mgr.revoke(holder, endpoint, attacker, bootstrap);
+        let result = mgr.revoke(holder, endpoint, revoker);
         assert!(matches!(result, Err(CapabilityError::AccessDenied)));
 
-        // Holder's capability is still present.
+        // Holder's capability is still present, with its rights.
+        assert!(mgr.verify_access(holder, endpoint, held).is_ok());
+    }
+
+    /// P3.12b — the success side of P3.12: a distinct registered revoker
+    /// holding `revoke` on `endpoint` revokes the holder's capability,
+    /// after which the holder is denied and the revoker keeps its own.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn proof_revoke_with_revoke_right_removes_holder_capability() {
+        let mut mgr = make_manager(3);
+        let holder = ProcessId::new(1, 0);
+        let revoker = ProcessId::new(2, 0);
+        let endpoint = EndpointId(7);
+        mgr.register_process(holder).unwrap();
+        mgr.register_process(revoker).unwrap();
+        mgr.grant_capability(holder, endpoint, CapabilityRights::SEND_ONLY).unwrap();
+        let mut rights = any_rights();
+        rights.revoke = true;
+        mgr.grant_capability(revoker, endpoint, rights).unwrap();
+
+        assert!(mgr.revoke(holder, endpoint, revoker).is_ok());
         assert!(mgr
             .verify_access(holder, endpoint, CapabilityRights::SEND_ONLY)
-            .is_ok());
+            .is_err());
+        assert!(mgr.verify_access(revoker, endpoint, rights).is_ok());
     }
 
     // ------------------------------------------------------------------------

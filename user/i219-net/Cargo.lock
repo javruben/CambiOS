@@ -12,6 +12,8 @@ version = "0.1.0"
 dependencies = [
  "cambios-libsys",
  "cambios-libsys-rt",
+ "cambios-net-proto",
+ "cambios-net-seam",
 ]
 
 [[package]]
@@ -26,4 +28,17 @@ name = "cambios-libsys-rt"
 version = "0.1.0"
 dependencies = [
  "cambios-libsys",
+ "cambios-manifest",
 ]
+
+[[package]]
+name = "cambios-manifest"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-net-proto"
+version = "0.1.0"
+
+[[package]]
+name = "cambios-net-seam"
+version = "0.1.0"

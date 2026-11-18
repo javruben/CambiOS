@@ -18,6 +18,15 @@
 pub mod mmio;
 pub mod spinlock;
 
+/// Why the CPU's hardware random number generator produced nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntropyError {
+    /// This CPU has no generator the kernel knows how to use.
+    Unsupported,
+    /// The generator reported failure on every attempt in the retry bound.
+    Exhausted,
+}
+
 // Architecture-specific modules
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

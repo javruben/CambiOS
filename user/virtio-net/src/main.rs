@@ -34,12 +34,14 @@
 
 mod device;
 mod pci;
+mod seam;
 #[allow(unsafe_code)]
 mod transport;
 #[allow(unsafe_code)]
 mod virtqueue;
 
 use cambios_libsys as sys;
+use cambios_net_proto as proto;
 use transport::{LegacyMmioTransport, ModernPciTransport, NotifyToken, Transport};
 use virtqueue::{BounceBuffer, VirtQueue};
 
@@ -53,6 +55,10 @@ use virtqueue::{BounceBuffer, VirtQueue};
 // ============================================================================
 
 const NET_ENDPOINT: u32 = 20;
+
+/// TUNING: frames taken from the TX ring per loop pass, so a busy stack
+/// cannot starve ep 20 or the RX direction.
+const SEAM_TX_BUDGET: usize = 32;
 
 const CMD_SEND_PACKET: u8 = 1;
 const CMD_RECV_PACKET: u8 = 2;
@@ -78,6 +84,11 @@ const VIRTIO_NET_HDR_SIZE_MODERN: usize = 12;
 
 /// Number of pre-posted RX bounce buffers.
 const RX_RING_SIZE: usize = 16;
+/// TUNING: TX bounce buffers, one per descriptor in flight. A single
+/// shared buffer let a second frame overwrite the first while the device
+/// was still reading it (build1-3626 pcap: earlier frames lost, the last
+/// one sent several times) as soon as one completion arrived late.
+const TX_RING_SIZE: usize = 16;
 
 /// RX queue index in virtio-net (queue 0 = receiveq).
 const RX_QUEUE: u16 = 0;
@@ -101,8 +112,13 @@ struct NetDriver {
     /// Pre-allocated RX bounce buffers. Posted to the RX queue at init;
     /// recycled after each received packet.
     rx_bufs: [Option<BounceBuffer>; RX_RING_SIZE],
-    /// Single TX bounce buffer (synchronous sends — one at a time).
-    tx_buf: BounceBuffer,
+    /// TX bounce buffers; `tx_busy[k]` while buffer `k` is posted and its
+    /// completion has not been reaped.
+    tx_bufs: [Option<BounceBuffer>; TX_RING_SIZE],
+    tx_busy: [bool; TX_RING_SIZE],
+    /// Buffers usable at once: never more than the TX queue's descriptors,
+    /// so a free buffer always has a free descriptor.
+    tx_slots: usize,
     /// Wire-format virtio-net header size (10 legacy / 12 modern; see
     /// VIRTIO_NET_HDR_SIZE_* constants). Must match what the device
     /// expects or 2 bytes of every packet are misinterpreted.
@@ -194,8 +210,11 @@ impl NetDriver {
         // Read MAC address
         let mac = transport.read_mac();
 
-        // Step 7: Allocate TX bounce buffer
-        let tx_buf = BounceBuffer::new()?;
+        // Step 7: Allocate TX bounce buffers
+        let mut tx_bufs: [Option<BounceBuffer>; TX_RING_SIZE] = core::array::from_fn(|_| None);
+        for b in tx_bufs.iter_mut() {
+            *b = Some(BounceBuffer::new()?);
+        }
 
         // Step 8: Allocate and post RX bounce buffers
         let rx_bufs: [Option<BounceBuffer>; RX_RING_SIZE] =
@@ -215,7 +234,9 @@ impl NetDriver {
             rx_queue,
             tx_queue,
             rx_bufs,
-            tx_buf,
+            tx_bufs,
+            tx_busy: [false; TX_RING_SIZE],
+            tx_slots: TX_RING_SIZE.min(usize::from(tx_qsize)),
             hdr_size,
         };
 
@@ -254,63 +275,73 @@ impl NetDriver {
         self.transport.notify(RX_QUEUE, self.rx_notify);
     }
 
-    /// Send a packet. Copies data to TX bounce buffer with virtio-net header,
-    /// posts to TX queue, notifies device, and waits for completion.
+    /// Free every TX buffer whose descriptor the device has completed.
+    fn reap_tx(&mut self) {
+        while let Some((done, _len)) = self.tx_queue.pop_used() {
+            for (b, busy) in self.tx_bufs.iter().zip(self.tx_busy.iter_mut()) {
+                if b.as_ref().is_some_and(|b| b.paddr == done.paddr) {
+                    *busy = false;
+                }
+            }
+        }
+    }
+
+    /// A TX buffer not in flight, reaping completions first; if all are in
+    /// flight, yield a bounded number of times for the device to finish.
+    fn free_tx(&mut self) -> Option<usize> {
+        // QEMU TCG processes virtio TX in its event loop, which runs when
+        // the guest halts: yielding lets the idle task hlt.
+        for attempt in 0..=20 {
+            self.reap_tx();
+            if let Some(k) = self.tx_busy.iter().take(self.tx_slots).position(|b| !b) {
+                return Some(k);
+            }
+            if attempt < 20 {
+                sys::yield_now();
+            }
+        }
+        None
+    }
+
+    /// Send a packet: copy it with the virtio-net header into a free TX
+    /// bounce buffer, post it and notify the device. Completion is reaped
+    /// later, so frames sent back to back each keep their own buffer.
+    /// `false`: dropped (dead queue, too large, or every buffer in flight).
     fn send_packet(&mut self, packet: &[u8]) -> bool {
         if self.tx_queue.is_dead() {
             return false;
         }
-
-        let total_len = self.hdr_size + packet.len();
-        if total_len > self.tx_buf.size as usize {
+        let Some(k) = self.free_tx() else { return false };
+        let hdr_size = self.hdr_size;
+        let Some(buf) = self.tx_bufs.get_mut(k).and_then(Option::as_mut) else { return false };
+        let total_len = hdr_size + packet.len();
+        if total_len > buf.size as usize {
             return false; // Packet too large
         }
 
         // Build virtio-net header (all zeros = no offload)
-        self.tx_buf.zero();
+        buf.zero();
         // Copy packet data after the header
-        let dst = (self.tx_buf.vaddr + self.hdr_size as u64) as *mut u8;
-        // This write goes to the bounce buffer (driver memory), not device memory
+        let dst = (buf.vaddr + hdr_size as u64) as *mut u8;
+        // SAFETY: `dst .. dst + packet.len()` lies inside this bounce
+        // buffer (`total_len <= size` above), driver memory that no posted
+        // descriptor references (`tx_busy[k]` is false), and `packet` is a
+        // separate slice.
         #[allow(unsafe_code)]
         unsafe {
             core::ptr::copy_nonoverlapping(packet.as_ptr(), dst, packet.len());
         }
+        let (paddr, vaddr) = (buf.paddr, buf.vaddr);
 
         // Post to TX queue
-        if self.tx_queue.push_buffer(
-            self.tx_buf.paddr,
-            self.tx_buf.vaddr,
-            total_len as u32,
-            false, // driver-readable (TX)
-        ).is_none() {
+        if self.tx_queue.push_buffer(paddr, vaddr, total_len as u32, false).is_none() {
             return false;
         }
-
-        // Notify device and wait for TX completion.
-        //
-        // QEMU TCG processes virtio TX in its event loop, not synchronously
-        // on the notify port write. The event loop runs when the guest does
-        // hlt. We use SYS_YIELD to relinquish our time slice — the idle task
-        // runs hlt, QEMU completes the TX, and when we're re-scheduled the
-        // used ring is updated.
+        if let Some(busy) = self.tx_busy.get_mut(k) {
+            *busy = true;
+        }
         self.transport.notify(TX_QUEUE_IDX, self.tx_notify);
-
-        // Quick check in case QEMU completed it synchronously
-        if self.tx_queue.pop_used().is_some() {
-            return true;
-        }
-
-        // Yield → idle → hlt → QEMU processes TX → we get re-scheduled
-        for _ in 0..20 {
-            sys::yield_now();
-            // After yield, if the timer preempted us and idle ran hlt,
-            // the TX should be done. Check immediately.
-            if let Some((_pending, _len)) = self.tx_queue.pop_used() {
-                return true;
-            }
-        }
-
-        false
+        true
     }
 
     /// Poll for a received packet. Returns the number of payload bytes
@@ -382,6 +413,15 @@ fn print_mac(mac: &[u8; 6]) {
 // ============================================================================
 // Request handlers
 // ============================================================================
+
+impl seam::Nic for NetDriver {
+    fn transmit(&mut self, frame: &[u8]) {
+        let _ = self.send_packet(frame);
+    }
+    fn receive(&mut self, buf: &mut [u8]) -> usize {
+        self.recv_packet(buf)
+    }
+}
 
 fn handle_get_mac(driver: &NetDriver, response: &mut [u8]) -> usize {
     response[0] = STATUS_OK;
@@ -523,35 +563,55 @@ fn run() -> ! {
     cambios_libsys_rt::ready();
 
     // Step 5: Service loop — recv_verified rejects anonymous senders.
+    //
+    // Without a seam the loop blocks on ep 20 as before (the legacy
+    // SEND_PACKET / RECV_PACKET path udp-stack uses). With a seam open it
+    // polls: ep 20 without blocking, then the TX ring, then the device's
+    // RX queue into the RX ring, then yields.
+    // Deferred: SEND_PACKET / RECV_PACKET removal (ADR-039 § 2).
+    // Why: udp-stack, the only client of the 256-byte frame path, is
+    //   replaced by net-stack in a later change; removing them first would
+    //   leave the image without NTP or UDP in between.
+    // Revisit when: user/net-stack replaces udp-stack in manifest.toml.
     let mut recv_buf = [0u8; 256];
     let mut resp_buf = [0u8; 256];
+    let mut seam: Option<seam::Seam> = None;
 
     loop {
-        let msg = match sys::recv_verified(NET_ENDPOINT, &mut recv_buf) {
-            Some(msg) => msg,
-            None => {
-                sys::yield_now();
-                continue;
+        let polled = seam.is_some();
+        let msg = if polled {
+            sys::try_recv_verified(NET_ENDPOINT, &mut recv_buf)
+        } else {
+            sys::recv_verified(NET_ENDPOINT, &mut recv_buf)
+        };
+        let got_msg = msg.is_some();
+
+        if let Some(msg) = msg {
+            if let Some((cmd, cmd_data)) = msg.command() {
+                let reply_len = match cmd {
+                    CMD_SEND_PACKET => Some(handle_send_packet(&mut driver, cmd_data, &mut resp_buf)),
+                    CMD_RECV_PACKET => Some(handle_recv_packet(&mut driver, &mut resp_buf)),
+                    CMD_GET_MAC => Some(handle_get_mac(&driver, &mut resp_buf)),
+                    CMD_GET_STATUS => Some(handle_get_status(&driver, &mut resp_buf)),
+                    proto::NIC_OPEN_SEAM | proto::NIC_CLOSE_SEAM | proto::NIC_DOORBELL_TX => {
+                        seam::handle_command(&mut seam, msg.sender(), msg.payload(), &mut resp_buf)
+                    }
+                    _ => {
+                        resp_buf[0] = STATUS_ERROR;
+                        Some(1)
+                    }
+                };
+                if let Some(n) = reply_len {
+                    sys::write(msg.from_endpoint(), &resp_buf[..n]);
+                }
             }
-        };
+        }
 
-        let (cmd, cmd_data) = match msg.command() {
-            Some(pair) => pair,
-            None => continue,
-        };
+        seam::service(&mut seam, &mut driver, SEAM_TX_BUDGET, RX_RING_SIZE);
 
-        let resp_len = match cmd {
-            CMD_SEND_PACKET => handle_send_packet(&mut driver, cmd_data, &mut resp_buf),
-            CMD_RECV_PACKET => handle_recv_packet(&mut driver, &mut resp_buf),
-            CMD_GET_MAC => handle_get_mac(&driver, &mut resp_buf),
-            CMD_GET_STATUS => handle_get_status(&driver, &mut resp_buf),
-            _ => {
-                resp_buf[0] = STATUS_ERROR;
-                1
-            }
-        };
-
-        sys::write(msg.from_endpoint(), &resp_buf[..resp_len]);
+        if polled && !got_msg {
+            sys::yield_now();
+        }
     }
 }
 

@@ -17,7 +17,8 @@
 #   17 key-store-service               27 scanout driver
 #   18 shell                           28 compositor
 #   20 virtio-net                      30 compositor input
-#   21 udp-stack                       31 usb-host
+#   21 net-stack (UDP; udp-stack on aarch64/riscv64)  31 usb-host
+#   34 net-stack (sockets)  35 net-probe  36 net-stack (seam)
 #   22/23 policy query/response        32 fde-mount
 #                                      33 ccid
 #   19 ping                            61 tree   62 worm   63 sprouty
@@ -127,15 +128,50 @@ depends_on_endpoints = [26]
 
 [[service]]
 name = "virtio-net"
-syscalls = ["alloc-dma", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "virtio-modern-caps", "write", "yield"]
+syscalls = ["alloc-dma", "channel-attach", "channel-close", "channel-info", "device-info", "exit", "get-pid", "get-principal", "get-time", "map-mmio", "print", "recv-msg", "register-endpoint", "try-recv-msg", "virtio-modern-caps", "write", "yield"]
 endpoints = [20]
 
+# net-stack — ADR-039 § 1 stack shell, replacing udp-stack (migration
+# step 6): the NIC seam (ep 36), cambios-netcore on QEMU's static slirp
+# address, udp-stack's ep 21 surface, socket control on ep 34 with
+# per-socket stream channels (TCP opens need an ISS key from the
+# hardware RNG via get-entropy; without one they are refused) and the
+# NTP wall clock. Applying a DHCP lease to the interface is still in
+# progress (codex D1).
+# x86_64 only: aarch64 and riscv64 keep udp-stack (below) until
+# net-stack's DHCP/UDP/NTP parity is shown there (codex ruling
+# 2026-11-12).
+[[service]]
+name = "net-stack"
+syscalls = ["channel-close", "channel-create", "exit", "get-entropy", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "set-wallclock", "try-recv-msg", "write", "yield"]
+endpoints = [21, 34, 36]
+system = ["create-channel", "set-wallclock"]
+depends_on = ["virtio-net"]
+arch = ["x86_64"]
+
+# udp-stack — the pre-ADR-039 UDP service on ep 21, over virtio-net's
+# legacy ep 20 path. Kept on aarch64/riscv64 only.
+# Revisit when: net-stack passes the net-probe DHCP/UDP/NTP checks on
+# aarch64 and riscv64; then this entry and user/udp-stack go.
 [[service]]
 name = "udp-stack"
 syscalls = ["exit", "get-pid", "get-principal", "get-time", "print", "recv-msg", "register-endpoint", "set-wallclock", "write", "yield"]
 endpoints = [21]
 system = ["set-wallclock"]
 depends_on = ["virtio-net"]
+arch = ["aarch64", "riscv64"]
+
+# net-probe — one-shot boot probe of net-stack's ep 21 and ep 34 from
+# the ADR-039 test-client endpoint; prints ok/FAIL per check and exits.
+# Revisit when: the ADR-039 step 7 clients (libnet, tcp-echo) exercise
+# these surfaces, then this probe goes.
+[[service]]
+name = "net-probe"
+syscalls = ["channel-attach", "exit", "get-entropy", "get-pid", "get-principal", "get-time", "get-wallclock", "print", "recv-msg", "register-endpoint", "try-recv-msg", "write", "yield"]
+endpoints = [35]
+lifetime = "one-shot"
+depends_on = ["net-stack"]
+arch = ["x86_64"]
 
 # --- GUI stack -----------------------------------------------------------------
 
